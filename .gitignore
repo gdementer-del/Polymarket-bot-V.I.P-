@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+
+# Runtime state and local research output
+/state/
+/logs/
+/run_logs/
+/runs/
+/tmp/
+
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+*.local.toml
+config.local.toml
+
+# Logs, dumps, and backups
+*.log
+*.bak
+*.bak-*
+*.tmp
+*.dump
+*.trace
+
+# Editor and OS metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Generated reports and bulky exports
+*.csv
+*.jsonl
+*.parquet
+*.sqlite
+*.db
