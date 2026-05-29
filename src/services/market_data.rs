@@ -527,7 +527,7 @@ impl MarketDataClient {
         let per_target = max_markets
             .div_ceil(target_count)
             .clamp(8, MARKET_LOOKUP_CAP);
-        let now_ts = self.current_server_time_secs().await?;
+        let now_ts = self.current_server_time_secs_fast().await;
 
         let candidate_slugs = unique_targets
             .iter()
@@ -597,7 +597,7 @@ impl MarketDataClient {
             return Ok(cached.markets);
         }
 
-        let now_ts = self.current_server_time_secs().await?;
+        let now_ts = self.current_server_time_secs_fast().await;
         let unique_targets = dedupe_targets(targets);
         let mut seen = HashSet::with_capacity(unique_targets.len().saturating_mul(2));
         let mut candidate_slugs = Vec::with_capacity(unique_targets.len().saturating_mul(2));
@@ -668,6 +668,20 @@ impl MarketDataClient {
             cached_at_ms: local_now_ms,
         });
         Ok(server_ts)
+    }
+
+    /// Estimate current CLOB/server time without making a network request.
+    ///
+    /// Reactive paper scans should not block on `/time`; if we have a server
+    /// sample we project it forward, otherwise local UTC is close enough for
+    /// selecting 5-minute windows.
+    pub async fn current_server_time_secs_fast(&self) -> i64 {
+        let local_now_ms = Utc::now().timestamp_millis();
+        if let Some(cached) = *self.server_time_cache.read().await {
+            return project_cached_server_time_secs(cached, local_now_ms);
+        }
+
+        local_now_ms.div_euclid(1_000)
     }
 
     /// Fetch a single active supported market by slug.
@@ -1195,7 +1209,7 @@ impl MarketDataClient {
                     Err(error)
                         if should_retry_http_error(&error) && attempt < HTTP_RETRY_ATTEMPTS =>
                     {
-                        warn!(attempt, error = %error, "повторяем запрос {label}");
+                        warn!(attempt, error = %error, "retrying HTTP response for {label}");
                     }
                     Err(error) => {
                         let status = error.status().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1204,7 +1218,7 @@ impl MarketDataClient {
                     }
                 },
                 Err(error) if should_retry_http_error(&error) && attempt < HTTP_RETRY_ATTEMPTS => {
-                    warn!(attempt, error = %error, "повторяем отправку запроса {label}");
+                    warn!(attempt, error = %error, "retrying HTTP request for {label}");
                 }
                 Err(error) => return Err(error.into()),
             }

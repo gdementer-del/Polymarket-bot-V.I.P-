@@ -706,6 +706,7 @@ async fn run_loop(
 
         if mode == BotMode::Paper {
             let closed_positions = settle_resolved_paper_positions(
+                config,
                 &journal,
                 binance_client,
                 &paper,
@@ -996,7 +997,7 @@ async fn run_loop(
                     &opportunity,
                     repeat_entry_observed_at,
                 ) {
-                    info!(
+                    debug!(
                         slug = %opportunity.slug,
                         kind = opportunity.kind.as_str(),
                         reason = %reason,
@@ -1422,6 +1423,19 @@ fn start_runtime_market_streams(
         }
     }
 
+    if config.run.chainlink_oracle.enabled {
+        let targets = configured_market_targets(config);
+        if binance_client.start_chainlink_oracle_stream(
+            config.http.polymarket_rtds_ws_url.clone(),
+            &targets,
+            config.run.chainlink_oracle,
+        ) {
+            info!("started Polymarket RTDS Chainlink oracle stream");
+        } else {
+            warn!("failed to start Polymarket RTDS Chainlink oracle stream");
+        }
+    }
+
     if config.run.polymarket_stream.enabled {
         data_client.ensure_market_stream_started();
         info!("websocket- Polymarket");
@@ -1655,7 +1669,9 @@ fn repeated_entry_block_reason(
     }
 
     if !config.run.scale_in.enabled {
-        return None;
+        return Some(
+            "repeat entry skipped because scale-in is disabled while a position is open".to_owned(),
+        );
     }
 
     let max_total_entries =
@@ -5808,6 +5824,7 @@ fn show_paper_positions(config: &AppConfig) -> Result<()> {
 }
 
 async fn settle_resolved_paper_positions(
+    config: &AppConfig,
     journal: &JournalStore,
     binance_client: &BinanceClient,
     paper: &PaperExecutor,
@@ -5823,16 +5840,23 @@ async fn settle_resolved_paper_positions(
     let open_slugs = snapshot.open_positions.keys().cloned().collect::<Vec<_>>();
     let mut close_reports = Vec::new();
     for slug in open_slugs {
-        let resolution = match binance_client.resolution_from_slug(&slug).await {
-            Ok(Some(resolution)) => resolution,
-            Ok(None) => continue,
-            Err(error) => {
-                warn!(
-                    slug = %slug,
-                    error = %error,
-                    "paper settlement lookup failed; keeping position open for retry"
-                );
-                continue;
+        let resolution = if should_use_fast_paper_settlement(config) {
+            match binance_client.resolution_from_slug_live_cache(&slug).await {
+                Some(resolution) => resolution,
+                None => continue,
+            }
+        } else {
+            match binance_client.resolution_from_slug(&slug).await {
+                Ok(Some(resolution)) => resolution,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        slug = %slug,
+                        error = %error,
+                        "paper settlement lookup failed; keeping position open for retry"
+                    );
+                    continue;
+                }
             }
         };
         let Some(close_report) = paper
@@ -5862,6 +5886,10 @@ async fn settle_resolved_paper_positions(
     flush_paper_journal_if_needed(paper_journal)?;
 
     Ok(close_reports)
+}
+
+fn should_use_fast_paper_settlement(config: &AppConfig) -> bool {
+    config.run.reactive && should_use_live_only_polymarket_books(config)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6491,6 +6519,18 @@ fn scalp_exit_reason(
         ));
     }
 
+    if exit_config.near_expiry_secs > 0 && context.seconds_left <= exit_config.near_expiry_secs {
+        return Some(format!(
+            "early-exit scalp near-expiry: {}s left, entry {}, exit {}, delta {}, mtm {} USDC, held {}s",
+            context.seconds_left,
+            entry_price.round_dp(4),
+            exit_price.round_dp(4),
+            price_delta.round_dp(4),
+            mark_to_market_profit.round_dp(4),
+            held_seconds
+        ));
+    }
+
     let aligned_gap_bps = aligned_move_bps(context.target_gap_bps, primary_side);
     let aligned_5s_bps = aligned_move_bps(context.spot_move_5s_bps, primary_side);
     if exit_config.scalp_invalidation_exit_enabled
@@ -6836,6 +6876,8 @@ fn classify_close_reason(reason: &str) -> &'static str {
         "early_exit_scalp_stop_loss"
     } else if reason.starts_with("early-exit scalp signal-invalidation") {
         "early_exit_scalp_signal_invalidation"
+    } else if reason.starts_with("early-exit scalp near-expiry") {
+        "early_exit_scalp_near_expiry"
     } else if reason.starts_with("early-exit scalp time-stop") {
         "early_exit_scalp_time_stop"
     } else if reason.starts_with("early-exit stop-loss") {
@@ -7063,7 +7105,7 @@ fn log_live_cycle_snapshot(
             "runtime near-miss candidate"
         );
     } else {
-        info!(
+        debug!(
             reason = %explain_no_near_miss_runtime(config, current_market),
             "runtime market has no candidate"
         );
@@ -8330,7 +8372,7 @@ async fn execute_and_log(
     executor: &impl TradeExecutor,
     opportunity: &Opportunity,
 ) -> Result<ExecutionReport> {
-    warn!(
+    info!(
         edge_bps = opportunity.edge_bps,
         dominant_outcome = %opportunity.dominant_outcome,
         spot_move_bps = %opportunity.spot_move_bps,
@@ -8811,7 +8853,7 @@ async fn collect_reactive_market_snapshot(
     }
     let mut live_markets = filter_markets_for_runtime_trigger(runtime_markets, trigger);
     if should_use_live_only_polymarket_books(config) {
-        let observed_ts = data_client.current_server_time_secs().await?;
+        let observed_ts = data_client.current_server_time_secs_fast().await;
         live_markets.retain(|market| market_window_is_live_at(market, observed_ts));
     }
     let markets = merge_markets_by_slug(
@@ -8976,7 +9018,7 @@ async fn collect_market_snapshot_for_markets_cached(
 ) -> Result<MarketSnapshot> {
     const REACTIVE_COMPONENT_TTL_MS: u128 = 500;
 
-    let observed_ts = data_client.current_server_time_secs().await?;
+    let observed_ts = data_client.current_server_time_secs_fast().await;
     let contexts =
         fetch_binance_contexts_for_markets(config, &markets, binance_client, observed_ts).await?;
 
@@ -9084,10 +9126,11 @@ async fn fetch_binance_contexts_for_markets(
             }
             Ok(None) => {}
             Err(AppError::InvalidMarket(message)) if message.contains("Binance") => {
-                warn!(
+                debug!(
                     slug = %slug,
                     target = ?target,
-                    ": Binance"
+                    reason = %message,
+                    "skipping market context after transient Binance data gap"
                 );
             }
             Err(error) => return Err(error),
@@ -9104,6 +9147,7 @@ fn log_market_context_source_health(
 ) {
     let mut binance_trade = 0_usize;
     let mut coinbase_ticker = 0_usize;
+    let mut chainlink_rtds = 0_usize;
     let mut binance_rest_latest = 0_usize;
     let mut binance_rest_1m_fallback = 0_usize;
     let mut other_source = 0_usize;
@@ -9118,6 +9162,7 @@ fn log_market_context_source_health(
         match context.current_spot_source.as_str() {
             "Binance::Trade" => binance_trade += 1,
             "Coinbase::Ticker" => coinbase_ticker += 1,
+            "Chainlink::RTDS" => chainlink_rtds += 1,
             "Binance::RestLatest" => binance_rest_latest += 1,
             "Binance::Rest1mFallback" => binance_rest_1m_fallback += 1,
             _ => other_source += 1,
@@ -9141,6 +9186,7 @@ fn log_market_context_source_health(
             contexts = contexts.len(),
             binance_trade,
             coinbase_ticker,
+            chainlink_rtds,
             binance_rest_latest,
             binance_rest_1m_fallback,
             other_source,
@@ -9239,7 +9285,7 @@ async fn fetch_fresh_market_snapshot_for_markets(
     include_trade_flows: bool,
     allow_rest_orderbook_fallback: bool,
 ) -> Result<MarketSnapshot> {
-    let observed_ts = data_client.current_server_time_secs().await?;
+    let observed_ts = data_client.current_server_time_secs_fast().await;
     debug!(markets = markets.len(), "fresh market snapshot started");
 
     let token_ids = markets
@@ -9292,10 +9338,11 @@ async fn fetch_fresh_market_snapshot_for_markets(
             }
             Ok(None) => {}
             Err(AppError::InvalidMarket(message)) if message.contains("Binance") => {
-                warn!(
+                debug!(
                     slug = %slug,
                     target = ?target,
-                    ": Binance"
+                    reason = %message,
+                    "skipping market context after transient Binance data gap"
                 );
             }
             Err(error) => return Err(error),
@@ -9552,7 +9599,7 @@ async fn revalidate_opportunity(
         data_client.fetch_order_books(&token_ids).await?
     };
 
-    let observed_ts = data_client.current_server_time_secs().await?;
+    let observed_ts = data_client.current_server_time_secs_fast().await;
     let context = match binance_client
         .market_context_at_timestamp(&market, observed_ts)
         .await
@@ -9560,9 +9607,10 @@ async fn revalidate_opportunity(
         Ok(Some(context)) => context,
         Ok(None) => return Ok(None),
         Err(AppError::InvalidMarket(message)) if message.contains("Binance") => {
-            warn!(
+            debug!(
                 slug = %market.slug,
-                ": Binance"
+                reason = %message,
+                "skipping revalidation after transient Binance data gap"
             );
             return Ok(None);
         }
@@ -11091,6 +11139,26 @@ mod tests {
     }
 
     #[test]
+    fn repeat_entry_blocks_scale_in_when_scale_in_is_disabled() {
+        let raw = include_str!("../../config.codex-scalp-v1-raw-light-v3.toml");
+        let config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
+        assert!(config.run.allow_repeat_entries_same_window);
+        assert!(!config.run.scale_in.enabled);
+
+        let opportunity = test_opportunity("btc-updown-5m-scale-disabled", "10", "Down");
+        let mut paper_state = PaperState::default();
+        paper_state.open_positions.insert(
+            opportunity.slug.clone(),
+            test_position(&opportunity.slug, "0", "10"),
+        );
+
+        let reason =
+            repeated_entry_block_reason(&config, &paper_state, &HashSet::new(), &opportunity)
+                .expect("open position should block implicit scale-in");
+        assert!(reason.contains("scale-in is disabled"));
+    }
+
+    #[test]
     fn repeat_entry_throttle_does_not_block_opposite_side() {
         let raw = include_str!("../../config.codex-scalp-v1-raw-light-v3.toml");
         let config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
@@ -11632,6 +11700,43 @@ mod tests {
     }
 
     #[test]
+    fn scalp_exit_reason_closes_before_settlement_window() {
+        let slug = "btc-updown-5m-scalp-near-expiry";
+        let mut position = test_position(slug, "10", "0");
+        position.kind = OpportunityKind::CodexScalpProbeV1;
+        position.opened_at = Utc::now() - chrono::Duration::seconds(20);
+
+        let mut books = HashMap::new();
+        books.insert(
+            format!("{slug}-up"),
+            test_book(&format!("{slug}-up"), "0.46", "10"),
+        );
+
+        let mut context = test_context();
+        context.seconds_left = 12;
+
+        let mut exit_config = EarlyExitConfig::default();
+        exit_config.scalp_exit_enabled = true;
+        exit_config.scalp_take_profit_price_delta = decimal("0.08");
+        exit_config.scalp_stop_loss_price_delta = Decimal::ZERO;
+        exit_config.scalp_time_stop_secs = 45;
+        exit_config.near_expiry_secs = 15;
+        exit_config.max_loss_usdc = Decimal::ZERO;
+        exit_config.min_hold_secs = 1;
+
+        let reason = early_exit_reason(
+            &position,
+            &context,
+            &books,
+            &exit_config,
+            PaperCostModel::new(0, 0),
+        )
+        .expect("scalp position should close before settlement when near expiry");
+
+        assert!(reason.starts_with("early-exit scalp near-expiry"));
+    }
+
+    #[test]
     fn scalp_exit_reason_waits_when_bid_depth_cannot_cover_position() {
         let slug = "btc-updown-5m-scalp-depth";
         let mut position = test_position(slug, "10", "0");
@@ -11891,6 +11996,10 @@ mod tests {
         assert_eq!(
             classify_close_reason("early-exit scalp signal-invalidation: entry 0.5000"),
             "early_exit_scalp_signal_invalidation"
+        );
+        assert_eq!(
+            classify_close_reason("early-exit scalp near-expiry: 12s left"),
+            "early_exit_scalp_near_expiry"
         );
         assert_eq!(
             classify_close_reason("early-exit scalp time-stop: entry 0.5000"),

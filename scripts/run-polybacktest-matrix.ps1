@@ -1,9 +1,9 @@
 param(
     [string[]]$Configs = @(
-        "config.bonereaper-state-v2.toml",
-        "config.bonereaper-state-v2b.toml",
-        "config.bonereaper-state-v4.toml",
-        "config.bonereaper-state-v4b.toml"
+        "config.codex-scalp-v1-raw-light-v3.toml",
+        "config.codex-scalp-v1-raw-light-v2.toml",
+        "config.codex-scalp-v1-raw.toml",
+        "config.codex-v4-champion.toml"
     ),
     [int]$WindowsPerTarget = 60,
     [int[]]$EntryMinutes = @(0, 1),

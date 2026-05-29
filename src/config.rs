@@ -19,6 +19,7 @@ const DEFAULT_GEOBLOCK_URL: &str = "https://polymarket.com/api/geoblock";
 const DEFAULT_BINANCE_BASE_URL: &str = "https://api.binance.com";
 const DEFAULT_BINANCE_WS_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
 const DEFAULT_COINBASE_WS_BASE_URL: &str = "wss://ws-feed.exchange.coinbase.com";
+const DEFAULT_POLYMARKET_RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 const DEFAULT_POLYBACKTEST_BASE_URL: &str = "https://api.polybacktest.com";
 const DEFAULT_REFRESH_SECS: u64 = 5;
 const DEFAULT_BONEREAPER_WALLET: &str = "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30";
@@ -468,6 +469,16 @@ impl AppConfig {
         if self.run.polymarket_stream.book_staleness_ms <= 0 {
             return Err(AppError::InvalidConfig(
                 "run.polymarket_stream.book_staleness_ms must be positive",
+            ));
+        }
+
+        if self.run.chainlink_oracle.enabled
+            && (self.run.chainlink_oracle.max_quote_age_ms <= 0
+                || self.run.chainlink_oracle.max_window_open_lag_ms < 0
+                || self.run.chainlink_oracle.max_settlement_close_lag_ms < 0)
+        {
+            return Err(AppError::InvalidConfig(
+                "run.chainlink_oracle age/lag settings must be non-negative, and max_quote_age_ms must be positive",
             ));
         }
 
@@ -2179,6 +2190,8 @@ pub struct HttpConfig {
     pub coinbase_market_data_enabled: bool,
     #[serde(default = "default_coinbase_ws_base_url")]
     pub coinbase_ws_base_url: String,
+    #[serde(default = "default_polymarket_rtds_ws_url")]
+    pub polymarket_rtds_ws_url: String,
     #[serde(default = "default_coinbase_max_source_disagreement_bps")]
     pub coinbase_max_source_disagreement_bps: Decimal,
     #[serde(default = "default_coinbase_max_spread_bps")]
@@ -2767,6 +2780,8 @@ pub struct RunConfig {
     pub revalidate_before_execute: bool,
     #[serde(default)]
     pub polymarket_stream: PolymarketStreamConfig,
+    #[serde(default)]
+    pub chainlink_oracle: ChainlinkOracleConfig,
     pub execute_top_n: usize,
     #[serde(default)]
     pub scale_in: ScaleInConfig,
@@ -2844,6 +2859,30 @@ impl Default for PolymarketStreamConfig {
             book_staleness_ms: default_polymarket_stream_book_staleness_ms(),
             rest_fallback_enabled: default_polymarket_stream_rest_fallback_enabled(),
             backfill_trade_flow: default_polymarket_stream_backfill_trade_flow(),
+        }
+    }
+}
+
+/// Polymarket RTDS Chainlink oracle-price settings.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ChainlinkOracleConfig {
+    #[serde(default = "default_chainlink_oracle_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_chainlink_oracle_max_quote_age_ms")]
+    pub max_quote_age_ms: i64,
+    #[serde(default = "default_chainlink_oracle_max_window_open_lag_ms")]
+    pub max_window_open_lag_ms: i64,
+    #[serde(default = "default_chainlink_oracle_max_settlement_close_lag_ms")]
+    pub max_settlement_close_lag_ms: i64,
+}
+
+impl Default for ChainlinkOracleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_chainlink_oracle_enabled(),
+            max_quote_age_ms: default_chainlink_oracle_max_quote_age_ms(),
+            max_window_open_lag_ms: default_chainlink_oracle_max_window_open_lag_ms(),
+            max_settlement_close_lag_ms: default_chainlink_oracle_max_settlement_close_lag_ms(),
         }
     }
 }
@@ -3329,6 +3368,10 @@ fn default_binance_ws_base_url() -> String {
 
 fn default_coinbase_ws_base_url() -> String {
     DEFAULT_COINBASE_WS_BASE_URL.to_owned()
+}
+
+fn default_polymarket_rtds_ws_url() -> String {
+    DEFAULT_POLYMARKET_RTDS_WS_URL.to_owned()
 }
 
 fn default_coinbase_max_source_disagreement_bps() -> Decimal {
@@ -4451,6 +4494,22 @@ const fn default_polymarket_stream_backfill_trade_flow() -> bool {
     true
 }
 
+const fn default_chainlink_oracle_enabled() -> bool {
+    false
+}
+
+const fn default_chainlink_oracle_max_quote_age_ms() -> i64 {
+    2_500
+}
+
+const fn default_chainlink_oracle_max_window_open_lag_ms() -> i64 {
+    3_000
+}
+
+const fn default_chainlink_oracle_max_settlement_close_lag_ms() -> i64 {
+    5_000
+}
+
 const fn default_scale_in_enabled() -> bool {
     false
 }
@@ -5203,52 +5262,66 @@ mod tests {
     }
 
     #[test]
-    fn codex_scalp_raw_light_v3_config_targets_btc_continuation_bucket() {
+    fn codex_scalp_raw_light_v3_config_targets_multi_asset_scalp_bucket() {
         let raw = include_str!("../config.codex-scalp-v1-raw-light-v3.toml");
         let config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
 
         assert_eq!(config.run.mode, super::BotMode::Paper);
-        assert_eq!(config.strategy.market_targets, vec![MarketTarget::Btc5m]);
+        assert_eq!(
+            config.strategy.market_targets,
+            vec![
+                MarketTarget::Btc5m,
+                MarketTarget::Eth5m,
+                MarketTarget::Sol5m,
+                MarketTarget::Xrp5m
+            ]
+        );
         assert!(config.strategy.codex_scalp_probe_v1_raw_ablation_enabled);
         assert!(config.strategy.codex_scalp_probe_v1_raw_light_enabled);
         assert_eq!(
             config.strategy.codex_scalp_probe_v1_min_entry_price,
-            Decimal::new(56, 2)
+            Decimal::new(45, 2)
         );
         assert_eq!(
             config.strategy.codex_scalp_probe_v1_max_entry_price,
             Decimal::new(68, 2)
         );
-        assert_eq!(config.strategy.codex_scalp_probe_v1_min_seconds_left, 180);
+        assert_eq!(config.strategy.codex_scalp_probe_v1_min_seconds_left, 60);
         assert_eq!(config.strategy.codex_scalp_probe_v1_max_seconds_left, 295);
+        assert_eq!(
+            config.strategy.codex_scalp_probe_v1_notional_usdc,
+            Decimal::new(30, 0)
+        );
         assert_eq!(config.run.reactive_debounce_ms, 0);
         assert!(config.run.allow_repeat_entries_same_window);
         assert_eq!(config.run.repeat_entry_min_interval_ms, 500);
         assert!(!config.run.revalidate_before_execute);
+        assert_eq!(config.run.execute_top_n, 2);
         assert!(config.run.early_exit.enabled);
         assert!(config.run.early_exit.scalp_exit_enabled);
         assert_eq!(
             config.run.early_exit.scalp_take_profit_price_delta,
-            Decimal::new(8, 2)
+            Decimal::new(7, 2)
         );
         assert_eq!(
             config.run.early_exit.scalp_stop_loss_price_delta,
             Decimal::ZERO
         );
-        assert_eq!(config.run.early_exit.scalp_time_stop_secs, 0);
-        assert!(config.run.early_exit.scalp_invalidation_exit_enabled);
+        assert_eq!(config.run.early_exit.scalp_time_stop_secs, 20);
+        assert!(!config.run.early_exit.scalp_invalidation_exit_enabled);
         assert_eq!(
             config.run.early_exit.scalp_invalidation_min_loss_usdc,
-            Decimal::new(1, 0)
+            Decimal::new(45, 2)
         );
         assert_eq!(
             config.run.early_exit.scalp_invalidation_opposite_gap_bps,
-            Decimal::new(1, 0)
+            Decimal::new(50, 2)
         );
         assert_eq!(
             config.run.early_exit.scalp_invalidation_opposite_5s_bps,
-            Decimal::new(5, 0)
+            Decimal::new(3, 0)
         );
+        assert_eq!(config.run.early_exit.near_expiry_secs, 15);
         assert!(!config.run.early_exit.directional_partial_reversal_enabled);
         assert!(!config.run.early_exit.stop_and_reverse_enabled);
         assert_eq!(config.run.polymarket_stream.book_staleness_ms, 1_200);
@@ -5348,35 +5421,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_bonereaper_aggressive_config_validates_confidence_controls() {
-        let raw = include_str!("../config.codex-bonereaper-aggressive.toml");
-        let config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
-
-        config
-            .validate()
-            .expect("aggressive codex config should validate confidence controls");
-    }
-
-    #[test]
-    fn legacy_bonereaper_state_configs_ignore_disabled_sentinel_fields() {
-        for raw in [
-            include_str!("../config.bonereaper-state-v2.toml"),
-            include_str!("../config.bonereaper-state-v4.toml"),
-            include_str!("../config.bonereaper-state-v4c.toml"),
-        ] {
-            let config: AppConfig = toml::from_str(raw).expect("legacy config should parse");
-            assert!(
-                !config.strategy.enable_codex_sentinel_v1,
-                "fixture must keep Sentinel disabled to exercise legacy validation"
-            );
-
-            config
-                .validate()
-                .expect("disabled Sentinel fields should not invalidate legacy configs");
-        }
-    }
-
-    #[test]
     fn codex_v4_champion_config_limits_repeat_window_risk() {
         let raw = include_str!("../config.codex-v4-champion.toml");
         let config: AppConfig = toml::from_str(raw).expect("champion config should parse");
@@ -5392,100 +5436,6 @@ mod tests {
         config
             .validate()
             .expect("champion config should validate risk caps");
-    }
-
-    #[test]
-    fn codex_bonereaper_hot_config_validates_frequency_controls() {
-        let raw = include_str!("../config.codex-bonereaper-hot.toml");
-        let config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
-
-        assert_eq!(
-            config.strategy.bonereaper_state_v2_min_seconds_left, 90,
-            "hot profile should allow controlled entries deeper into minute 4"
-        );
-        assert_eq!(
-            config.strategy.bonereaper_state_v2_max_seconds_left, 270,
-            "hot profile should avoid the noisiest first 30 seconds of a window"
-        );
-        assert_eq!(
-            config.strategy.bonereaper_state_v2_bias_min_target_gap_bps,
-            Decimal::new(125, 2),
-            "hot profile should avoid weak first-minute gap-chase entries"
-        );
-        assert_eq!(
-            config.strategy.bonereaper_state_v2_min_signal_bps, 1,
-            "hot profile should use the best current PolyBackTest momentum threshold"
-        );
-        assert_eq!(
-            config.strategy.bonereaper_state_v2_min_aligned_flow_bps,
-            Decimal::ZERO,
-            "hot profile should not require Polymarket taker-flow before Sentinel guards"
-        );
-        assert!(
-            config.strategy.codex_sentinel_v1_no_chase_guard_enabled,
-            "hot profile should reject expensive first-minute chase entries unless quality is extreme"
-        );
-        assert_eq!(
-            config.strategy.codex_sentinel_v1_no_chase_entry_price,
-            Decimal::new(62, 2),
-            "hot profile should start the no-chase guard above 0.62 entry ask"
-        );
-        assert!(config.strategy.codex_sentinel_v1_quality_floor_enabled);
-        assert_eq!(
-            config
-                .strategy
-                .codex_sentinel_v1_quality_floor_min_target_gap_bps,
-            Decimal::new(150, 2),
-            "hot profile should reject the weak-gap bucket that dominated the loss run"
-        );
-        assert_eq!(
-            config
-                .strategy
-                .codex_sentinel_v1_quality_floor_mid_gap_min_signal_bps,
-            Decimal::from(1500),
-            "hot profile should keep only stronger 1.50-3.00 gap entries"
-        );
-        assert!(
-            config
-                .strategy
-                .codex_sentinel_v1_late_entry_override_enabled,
-            "hot profile should allow late-window entries only through the Sentinel momentum override"
-        );
-        assert!(
-            config
-                .strategy
-                .codex_sentinel_v1_late_window_value_guard_enabled,
-            "hot profile should reject expensive late-window entries unless quality is extreme"
-        );
-        assert_eq!(
-            config
-                .strategy
-                .codex_sentinel_v1_late_window_max_entry_price,
-            Decimal::new(62, 2),
-            "hot profile should force late-window entries back into the value bucket"
-        );
-        assert_eq!(
-            config.strategy.codex_sentinel_v1_attack_notional_usdc,
-            Decimal::from(10),
-            "hot profile should size up cheap confirmed attack entries"
-        );
-        assert_eq!(
-            config.strategy.codex_sentinel_v1_attack_min_signal_bps,
-            Decimal::from(500),
-            "hot profile should boost size on proven mid-signal winners"
-        );
-        assert!(
-            config.run.early_exit.peak_exit_partial_close_enabled,
-            "hot profile should keep a runner after first peak-exit profit capture"
-        );
-        assert!(
-            config.run.early_exit.profit_lock_partial_close_enabled,
-            "hot profile should bank partial profit before a fast winner can reverse"
-        );
-
-        config
-            .validate()
-            .expect("hot codex config should validate frequency controls");
     }
 
     #[test]

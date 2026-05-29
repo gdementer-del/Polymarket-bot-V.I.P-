@@ -255,8 +255,8 @@ mod tests {
     #[test]
     fn analytics_report_computes_realized_metrics() {
         let entries = vec![
-            build_entry("btc-updown-5m-1", "Рост", 700),
-            build_entry("btc-updown-5m-2", "Падение", 500),
+            build_entry("btc-updown-5m-1", "Up", 700),
+            build_entry("btc-updown-5m-2", "Down", 500),
         ];
         let snapshot = PnlSnapshot {
             updated_at: Utc::now(),
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(report.pending_resolution_count, 0);
         assert_eq!(report.signal_accuracy_pct, Decimal::from(100_u32));
         assert_eq!(report.realized_profit_resolved, Decimal::new(14, 1));
-        assert_eq!(report.actual_outcome_distribution["Падение"], 1);
-        assert_eq!(report.actual_outcome_distribution["Рост"], 1);
+        assert_eq!(report.actual_outcome_distribution["Down"], 1);
+        assert_eq!(report.actual_outcome_distribution["Up"], 1);
     }
 }

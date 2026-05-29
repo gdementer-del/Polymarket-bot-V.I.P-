@@ -15,11 +15,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use crate::config::ChainlinkOracleConfig;
 use crate::error::{AppError, Result};
-use crate::models::{
-    BinaryMarket, MarketTarget, PAPER_OUTCOME_DOWN_LABEL_RU, PAPER_OUTCOME_UP_LABEL_RU,
-    TargetPriceSource,
-};
+use crate::models::{BinaryMarket, MarketTarget, TargetPriceSource};
+
+use super::chainlink::ChainlinkOracleCache;
 
 const MAX_CACHED_QUOTE_AGE_MS: i64 = 10_000;
 const MICRO_BURST_PRICE_WINDOW_MS: i64 = 1_000;
@@ -88,9 +88,9 @@ impl WindowDirection {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Up => "Рост",
-            Self::Down => "Падение",
-            Self::Flat => "Флэт",
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::Flat => "Flat",
         }
     }
 }
@@ -319,6 +319,7 @@ pub struct BinanceClient {
     live_snapshot_cache: Arc<RwLock<HashMap<String, LiveSignalState>>>,
     interval_open_cache: Arc<RwLock<HashMap<String, CachedIntervalOpenPrice>>>,
     historical_kline_cache: Arc<RwLock<HashMap<HistoricalKlineCacheKey, Vec<OneMinuteKline>>>>,
+    chainlink_oracle: ChainlinkOracleCache,
     started_symbols: Arc<Mutex<HashSet<String>>>,
     trigger_tx: watch::Sender<Option<BinanceTriggerEvent>>,
 }
@@ -344,6 +345,7 @@ impl BinanceClient {
             live_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
             interval_open_cache: Arc::new(RwLock::new(HashMap::new())),
             historical_kline_cache: Arc::new(RwLock::new(HashMap::new())),
+            chainlink_oracle: ChainlinkOracleCache::default(),
             started_symbols: Arc::new(Mutex::new(HashSet::new())),
             trigger_tx: watch::channel(None).0,
         })
@@ -353,6 +355,18 @@ impl BinanceClient {
     #[must_use]
     pub fn subscribe_triggers(&self) -> watch::Receiver<Option<BinanceTriggerEvent>> {
         self.trigger_tx.subscribe()
+    }
+
+    /// Start the Polymarket RTDS Chainlink oracle stream.
+    #[must_use]
+    pub fn start_chainlink_oracle_stream(
+        &self,
+        websocket_url: String,
+        targets: &[MarketTarget],
+        settings: ChainlinkOracleConfig,
+    ) -> bool {
+        self.chainlink_oracle
+            .start_stream(websocket_url, targets, settings)
     }
 
     /// Snapshot live quote/depth readiness for each configured symbol.
@@ -466,6 +480,10 @@ impl BinanceClient {
             * Decimal::from(10_000_u32))
         .round_dp(4);
         context.dominant_outcome = dominant_outcome_label(context.current_spot_price, target_price);
+        let _oracle_applied = self
+            .chainlink_oracle
+            .decorate_context(market, &mut context)
+            .await;
 
         Ok(Some(context))
     }
@@ -634,6 +652,17 @@ impl BinanceClient {
     ///
     /// Returns an error if Binance historical candle queries fail or return malformed data.
     pub async fn resolution_from_slug(&self, slug: &str) -> Result<Option<MarketWindowResolution>> {
+        if let Some(resolution) = self.chainlink_oracle.resolution_from_slug(slug).await {
+            debug!(
+                slug = %slug,
+                start_price = %resolution.start_price,
+                end_price = %resolution.end_price,
+                realized_move_bps = %resolution.realized_move_bps,
+                "using Chainlink RTDS cached oracle resolution"
+            );
+            return Ok(Some(resolution));
+        }
+
         let Some(target) = MarketTarget::from_slug(slug) else {
             return Ok(None);
         };
@@ -691,6 +720,34 @@ impl BinanceClient {
             last_kline.close,
             last_kline.close_time_ms,
         ))
+    }
+
+    /// Resolve a finished window using only in-memory live caches.
+    ///
+    /// This is intended for the reactive paper hot path, where blocking on
+    /// Binance REST after a window closes can stall new scalp decisions.
+    pub async fn resolution_from_slug_live_cache(
+        &self,
+        slug: &str,
+    ) -> Option<MarketWindowResolution> {
+        if let Some(resolution) = self.chainlink_oracle.resolution_from_slug(slug).await {
+            debug!(
+                slug = %slug,
+                start_price = %resolution.start_price,
+                end_price = %resolution.end_price,
+                realized_move_bps = %resolution.realized_move_bps,
+                "using Chainlink RTDS cached oracle resolution"
+            );
+            return Some(resolution);
+        }
+
+        let target = MarketTarget::from_slug(slug)?;
+        let start_ts = parse_window_start_ts(slug, target)?;
+        if Utc::now().timestamp() < start_ts.saturating_add(target.window_secs()) {
+            return None;
+        }
+
+        self.resolution_from_stream_cache(target, start_ts).await
     }
 
     async fn resolution_from_stream_cache(
@@ -856,9 +913,9 @@ impl BinanceClient {
         .round_dp(4);
 
         let dominant_outcome = if current_spot_price >= interval_open_price {
-            "Рост"
+            "Up"
         } else {
-            "Падение"
+            "Down"
         }
         .to_owned();
 
@@ -1963,9 +2020,9 @@ fn normalize_symbol(symbol: &str) -> String {
 
 fn dominant_outcome_label(current_spot_price: Decimal, target_price: Decimal) -> String {
     if current_spot_price >= target_price {
-        PAPER_OUTCOME_UP_LABEL_RU
+        "Up"
     } else {
-        PAPER_OUTCOME_DOWN_LABEL_RU
+        "Down"
     }
     .to_owned()
 }
@@ -2763,6 +2820,34 @@ mod tests {
         assert_eq!(resolution.start_price, Decimal::new(10_000, 2));
         assert_eq!(resolution.end_price, Decimal::new(10_100, 2));
         assert_eq!(resolution.actual_outcome, super::WindowDirection::Up);
+    }
+
+    #[tokio::test]
+    async fn live_cache_slug_resolution_avoids_rest_lookup() {
+        let client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("client");
+
+        client
+            .update_second_kline("btcusdt", r#"{"k":{"t":900000,"T":900999,"o":"100.00"}}"#)
+            .await
+            .expect("window-open kline");
+        client
+            .update_trade_quote("btcusdt", r#"{"E":1199900,"p":"99.00"}"#)
+            .await
+            .expect("near-close quote");
+
+        let resolution = client
+            .resolution_from_slug_live_cache("btc-updown-5m-900")
+            .await
+            .expect("stream-cache slug resolution");
+
+        assert_eq!(resolution.start_price, Decimal::new(10_000, 2));
+        assert_eq!(resolution.end_price, Decimal::new(9_900, 2));
+        assert_eq!(resolution.actual_outcome, super::WindowDirection::Down);
     }
 
     #[tokio::test]

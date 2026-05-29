@@ -2851,14 +2851,23 @@ impl BundleArbitrageStrategy {
         let primary = quote_for_side(quotes, decision.up_side);
         let primary_book = order_book_for_side(decision.up_side, book_refs);
         let raw_light_mode = codex_scalp_probe_v1_raw_light_mode(&self.config);
+        let raw_light_profile =
+            raw_light_mode.then(|| codex_scalp_probe_v1_raw_light_profile(context.target));
         let use_bnb_pressure_thresholds = !raw_light_mode
             && self.config.codex_scalp_probe_v1_bnb_pressure_enabled
             && context.target == MarketTarget::Bnb5m;
+        let min_entry_price = raw_light_profile.map_or(
+            self.config.codex_scalp_probe_v1_min_entry_price,
+            |profile| profile.min_entry_price,
+        );
         let max_entry_price = if use_bnb_pressure_thresholds {
             self.config
                 .codex_scalp_probe_v1_bnb_pressure_max_entry_price
         } else {
-            self.config.codex_scalp_probe_v1_max_entry_price
+            raw_light_profile.map_or(
+                self.config.codex_scalp_probe_v1_max_entry_price,
+                |profile| profile.max_entry_price,
+            )
         };
         let max_book_age_ms = if use_bnb_pressure_thresholds {
             self.config
@@ -2910,10 +2919,8 @@ impl BundleArbitrageStrategy {
             ));
         }
 
-        if primary.ask_price < self.config.codex_scalp_probe_v1_min_entry_price {
-            let shortfall_bps = decimal_to_bps_ceil(
-                self.config.codex_scalp_probe_v1_min_entry_price - primary.ask_price,
-            );
+        if primary.ask_price < min_entry_price {
+            let shortfall_bps = decimal_to_bps_ceil(min_entry_price - primary.ask_price);
             return Some(scored_near_miss(
                 market,
                 context,
@@ -3082,8 +3089,25 @@ impl BundleArbitrageStrategy {
         }
 
         if raw_light_mode {
-            let profile = codex_scalp_probe_v1_raw_light_profile(context.target);
+            let profile = raw_light_profile
+                .unwrap_or_else(|| codex_scalp_probe_v1_raw_light_profile(context.target));
             let target_gap_abs = context.target_gap_bps.abs();
+            if target_gap_abs > profile.max_target_gap_bps {
+                let shortfall_bps =
+                    decimal_to_bps_ceil(target_gap_abs - profile.max_target_gap_bps);
+                return Some(scored_near_miss(
+                    market,
+                    context,
+                    kind,
+                    primary.label.to_owned(),
+                    Some(primary.ask_price),
+                    None,
+                    shortfall_bps,
+                    format!("gap {}", target_gap_abs.round_dp(2)),
+                    format!("target gap is too extended for scalp continuation in {label}"),
+                    0,
+                ));
+            }
             let aligned_micro_or_swing = decision
                 .aligned_micro_bps
                 .max(decision.aligned_swing_bps)
@@ -5752,7 +5776,9 @@ fn codex_scalp_probe_v1_standard_allows(
 
 #[derive(Debug, Clone, Copy)]
 struct CodexScalpProbeRawLightProfile {
+    min_entry_price: Decimal,
     max_entry_price: Decimal,
+    max_target_gap_bps: Decimal,
     cheap_entry_price: Decimal,
     min_signal_bps: Decimal,
     min_target_gap_bps: Decimal,
@@ -5770,7 +5796,9 @@ struct CodexScalpProbeRawLightProfile {
 fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpProbeRawLightProfile {
     match target {
         MarketTarget::Btc5m => CodexScalpProbeRawLightProfile {
-            max_entry_price: Decimal::new(70, 2),
+            min_entry_price: Decimal::new(50, 2),
+            max_entry_price: Decimal::new(68, 2),
+            max_target_gap_bps: Decimal::new(1200, 2),
             cheap_entry_price: Decimal::new(12, 2),
             min_signal_bps: Decimal::from(12_u32),
             min_target_gap_bps: Decimal::new(400, 2),
@@ -5784,7 +5812,9 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_aligned_bps: Decimal::new(400, 2),
         },
         MarketTarget::Eth5m => CodexScalpProbeRawLightProfile {
-            max_entry_price: Decimal::new(56, 2),
+            min_entry_price: Decimal::new(45, 2),
+            max_entry_price: Decimal::new(62, 2),
+            max_target_gap_bps: Decimal::new(1400, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(22_u32),
             min_target_gap_bps: Decimal::new(800, 2),
@@ -5798,7 +5828,9 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_aligned_bps: Decimal::new(700, 2),
         },
         MarketTarget::Sol5m => CodexScalpProbeRawLightProfile {
-            max_entry_price: Decimal::new(56, 2),
+            min_entry_price: Decimal::new(45, 2),
+            max_entry_price: Decimal::new(62, 2),
+            max_target_gap_bps: Decimal::new(1400, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(20_u32),
             min_target_gap_bps: Decimal::new(800, 2),
@@ -5812,7 +5844,9 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_aligned_bps: Decimal::new(700, 2),
         },
         MarketTarget::Xrp5m => CodexScalpProbeRawLightProfile {
-            max_entry_price: Decimal::new(50, 2),
+            min_entry_price: Decimal::new(40, 2),
+            max_entry_price: Decimal::new(58, 2),
+            max_target_gap_bps: Decimal::new(1200, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(22_u32),
             min_target_gap_bps: Decimal::new(700, 2),
@@ -5826,7 +5860,9 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_aligned_bps: Decimal::new(700, 2),
         },
         MarketTarget::Bnb5m => CodexScalpProbeRawLightProfile {
-            max_entry_price: Decimal::new(60, 2),
+            min_entry_price: Decimal::new(45, 2),
+            max_entry_price: Decimal::new(62, 2),
+            max_target_gap_bps: Decimal::new(1000, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(8_u32),
             min_target_gap_bps: Decimal::new(400, 2),
@@ -5840,7 +5876,9 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_aligned_bps: Decimal::new(250, 2),
         },
         MarketTarget::Btc15m | MarketTarget::Eth15m => CodexScalpProbeRawLightProfile {
+            min_entry_price: Decimal::MAX,
             max_entry_price: Decimal::ZERO,
+            max_target_gap_bps: Decimal::ZERO,
             cheap_entry_price: Decimal::ZERO,
             min_signal_bps: Decimal::MAX,
             min_target_gap_bps: Decimal::MAX,
@@ -5865,9 +5903,12 @@ fn codex_scalp_probe_v1_raw_light_allows(
 ) -> bool {
     if !codex_scalp_probe_v1_target_allowed(context.target)
         || !is_valid_binary_price(primary_ask_price)
-        || primary_ask_price < config.codex_scalp_probe_v1_min_entry_price
-        || primary_ask_price > config.codex_scalp_probe_v1_max_entry_price
     {
+        return false;
+    }
+
+    let profile = codex_scalp_probe_v1_raw_light_profile(context.target);
+    if primary_ask_price < profile.min_entry_price || primary_ask_price > profile.max_entry_price {
         return false;
     }
 
@@ -5903,13 +5944,15 @@ fn codex_scalp_probe_v1_raw_light_allows(
         return false;
     }
 
-    let profile = codex_scalp_probe_v1_raw_light_profile(context.target);
     let aligned_top_bps =
         aligned_move_bps(context.exchange_book_top_imbalance_bps, decision.up_side);
     let aligned_depth_bps =
         aligned_move_bps(context.exchange_book_depth_imbalance_bps, decision.up_side);
     let fresh_confirmation_bps = codex_scalp_probe_v1_live_burst_bps(context, decision);
     let target_gap_abs = context.target_gap_bps.abs();
+    if target_gap_abs > profile.max_target_gap_bps {
+        return false;
+    }
     let aligned_micro_or_swing = decision
         .aligned_micro_bps
         .max(decision.aligned_swing_bps)
@@ -8017,7 +8060,7 @@ mod tests {
         assert!(codex_scalp_probe_v1_allows(
             &context,
             &decision,
-            decimal("0.52"),
+            decimal("0.49"),
             &book,
             &config,
         ));
@@ -8063,7 +8106,7 @@ mod tests {
         assert!(!codex_scalp_probe_v1_allows(
             &context,
             &decision,
-            decimal("0.52"),
+            decimal("0.49"),
             &book,
             &config,
         ));
@@ -8385,7 +8428,7 @@ mod tests {
         assert!(!codex_scalp_probe_v1_allows(
             &context,
             &decision,
-            decimal("0.52"),
+            decimal("0.49"),
             &book,
             &config,
         ));

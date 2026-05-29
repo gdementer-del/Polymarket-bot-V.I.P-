@@ -194,9 +194,9 @@ pub(super) fn build_runtime_snapshot_summary(
             .zip(down_ask)
             .map(|(up_price, down_price)| (up_price + down_price).round_dp(6));
         let dominant_outcome = context.dominant_outcome.clone();
-        let missing_directional_ask = if dominant_outcome == "Рост" {
+        let missing_directional_ask = if dominant_outcome == "Up" {
             up_ask.is_none()
-        } else if dominant_outcome == "Падение" {
+        } else if dominant_outcome == "Down" {
             down_ask.is_none()
         } else {
             true
@@ -298,7 +298,7 @@ pub(super) fn build_paper_cycle_entry(
     );
     let base_reason = if let Some(opportunity) = opportunities.first() {
         Some(format!(
-            "сигнал {} | edge {} | spot {} | ask {} | usdc {}",
+            "signal {} | edge {} | spot {} | ask {} | usdc {}",
             opportunity.kind.as_str(),
             opportunity.edge_bps,
             opportunity.spot_move_bps.round_dp(2),
@@ -307,7 +307,7 @@ pub(super) fn build_paper_cycle_entry(
         ))
     } else if let Some(near_miss) = near_misses.first() {
         Some(format!(
-            "почти {} | gap {} | {}",
+            "near {} | gap {} | {}",
             near_miss.kind.as_str(),
             near_miss.shortfall_label,
             near_miss.reason
@@ -329,9 +329,9 @@ pub(super) fn build_paper_cycle_entry(
         .map(|value| format!(" | data: {value}"))
         .unwrap_or_default();
     let decision_reason = Some(format!(
-        "режим={} | {}{}{}{}",
+        "regime={} | {}{}{}{}",
         regime.as_str(),
-        base_reason.unwrap_or_else(|| "нет сигнала".to_owned()),
+        base_reason.unwrap_or_else(|| "no signal".to_owned()),
         worst_open_reason.unwrap_or_default(),
         regime_reason.map_or_else(String::new, |value| format!(" | mode: {value}")),
         risk_block_reason.map_or_else(String::new, |value| format!(" | risk: {value}"))

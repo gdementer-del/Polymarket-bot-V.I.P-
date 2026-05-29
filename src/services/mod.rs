@@ -3,6 +3,7 @@
 pub mod analytics;
 pub mod backtest;
 pub mod binance;
+pub mod chainlink;
 pub mod coinbase;
 pub mod execution;
 pub mod inventory;

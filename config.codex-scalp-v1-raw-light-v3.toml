@@ -1,6 +1,6 @@
 # Paper-only raw-light v3 profile.
-# Goal: test the BTC continuation bucket that survived v2 analysis:
-# entry ask 0.56-0.68, live quote/book freshness, and no cheap-lottery lane.
+# Goal: paper-only multi-asset scalp probe using fast Binance/Coinbase signals
+# plus Polymarket Chainlink RTDS target/gap/settlement anchoring.
 
 [http]
 gamma_base_url = "https://gamma-api.polymarket.com"
@@ -11,6 +11,7 @@ binance_base_url = "https://api.binance.com"
 binance_ws_base_url = "wss://stream.binance.com:9443/ws"
 coinbase_market_data_enabled = true
 coinbase_ws_base_url = "wss://ws-feed.exchange.coinbase.com"
+polymarket_rtds_ws_url = "wss://ws-live-data.polymarket.com"
 coinbase_max_source_disagreement_bps = "100"
 coinbase_max_spread_bps = "25"
 timeout_secs = 6
@@ -18,7 +19,7 @@ page_size = 200
 books_batch_size = 100
 
 [strategy]
-market_targets = ["btc-5m"]
+market_targets = ["btc-5m", "eth-5m", "sol-5m", "xrp-5m"]
 enable_bundle = false
 min_edge_bps = 0
 assumed_fee_bps = 100
@@ -58,12 +59,12 @@ enable_codex_sentinel_v1 = false
 enable_codex_scalp_probe_v1 = true
 codex_scalp_probe_v1_raw_ablation_enabled = true
 codex_scalp_probe_v1_raw_light_enabled = true
-codex_scalp_probe_v1_min_entry_price = "0.56"
+codex_scalp_probe_v1_min_entry_price = "0.45"
 codex_scalp_probe_v1_max_entry_price = "0.68"
 codex_scalp_probe_v1_max_entry_spread = "0.20"
 codex_scalp_probe_v1_min_elapsed_window_secs = 0
 codex_scalp_probe_v1_max_seconds_left = 295
-codex_scalp_probe_v1_min_seconds_left = 180
+codex_scalp_probe_v1_min_seconds_left = 60
 codex_scalp_probe_v1_max_book_age_ms = 1000
 codex_scalp_probe_v1_max_exchange_spread_bps = "10.00"
 codex_scalp_probe_v1_min_target_gap_bps = "0.00"
@@ -73,7 +74,7 @@ codex_scalp_probe_v1_min_flow_bps = "0"
 codex_scalp_probe_v1_min_top_imbalance_bps = "0"
 codex_scalp_probe_v1_min_depth_imbalance_bps = "0"
 codex_scalp_probe_v1_min_radar_score_bps = "0"
-codex_scalp_probe_v1_notional_usdc = "5"
+codex_scalp_probe_v1_notional_usdc = "30"
 codex_scalp_probe_v1_min_expected_profit_usdc = "0.00"
 codex_scalp_probe_v1_bnb_pressure_enabled = false
 
@@ -135,13 +136,19 @@ reactive_idle_secs = 0
 allow_repeat_entries_same_window = true
 repeat_entry_min_interval_ms = 500
 revalidate_before_execute = false
-execute_top_n = 1
+execute_top_n = 2
 
 [run.polymarket_stream]
 enabled = true
 book_staleness_ms = 1200
 rest_fallback_enabled = false
 backfill_trade_flow = false
+
+[run.chainlink_oracle]
+enabled = true
+max_quote_age_ms = 2500
+max_window_open_lag_ms = 3000
+max_settlement_close_lag_ms = 5000
 
 [run.scale_in]
 enabled = false
@@ -168,14 +175,14 @@ stop_and_reverse_enabled = false
 stop_and_reverse_on_stop_loss = false
 scalp_exit_enabled = true
 scalp_exit_apply_to_codex_sentinel_only = true
-scalp_take_profit_price_delta = "0.08"
+scalp_take_profit_price_delta = "0.07"
 scalp_stop_loss_price_delta = "0"
-scalp_time_stop_secs = 0
-scalp_invalidation_exit_enabled = true
-scalp_invalidation_min_loss_usdc = "1.00"
-scalp_invalidation_opposite_gap_bps = "1.00"
-scalp_invalidation_opposite_5s_bps = "5.00"
-near_expiry_secs = 0
+scalp_time_stop_secs = 20
+scalp_invalidation_exit_enabled = false
+scalp_invalidation_min_loss_usdc = "0.45"
+scalp_invalidation_opposite_gap_bps = "0.50"
+scalp_invalidation_opposite_5s_bps = "3.00"
+near_expiry_secs = 15
 
 [run.adaptive_regime]
 enabled = false

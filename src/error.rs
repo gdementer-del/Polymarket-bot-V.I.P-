@@ -11,53 +11,53 @@ pub type Result<T> = std::result::Result<T, AppError>;
 /// Application error.
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("ошибка ввода-вывода: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("ошибка HTTP-клиента: {0}")]
+    #[error("HTTP client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
-    #[error("ошибка JSON: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
     #[error("HTTP {code}: {body}")]
     HttpStatus { code: StatusCode, body: String },
 
-    #[error("не удалось прочитать конфиг {path}: {source}")]
+    #[error("failed to read config {path}: {source}")]
     ConfigRead {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("не удалось разобрать конфиг {path}: {source}")]
+    #[error("failed to parse config {path}: {source}")]
     ConfigParse {
         path: PathBuf,
         #[source]
         source: Box<toml::de::Error>,
     },
 
-    #[error("некорректная конфигурация: {0}")]
+    #[error("invalid config: {0}")]
     InvalidConfig(&'static str),
 
-    #[error("некорректные настройки live-аутентификации: {0}")]
+    #[error("invalid live auth settings: {0}")]
     InvalidLiveAuth(String),
 
-    #[error("некорректные данные рынка: {0}")]
+    #[error("invalid market data: {0}")]
     InvalidMarket(String),
 
-    #[error("не задана обязательная переменная окружения `{0}`")]
+    #[error("required environment variable `{0}` is not set")]
     MissingEnvVar(String),
 
-    #[error("интерактивный ввод секрета недоступен; задайте `{0}` через переменную окружения")]
+    #[error("interactive secret input is unavailable; set `{0}` through an environment variable")]
     InteractiveInputUnavailable(String),
 
-    #[error("live-торговля заблокирована в этой юрисдикции: {country}/{region}")]
+    #[error("live trading is blocked in this jurisdiction: {country}/{region}")]
     Geoblocked { country: String, region: String },
 
-    #[error("ошибка live-исполнения: {0}")]
+    #[error("live execution error: {0}")]
     LiveExecution(String),
 
-    #[error("ошибка SDK: {0}")]
+    #[error("SDK error: {0}")]
     Sdk(String),
 }

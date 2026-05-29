@@ -90,6 +90,18 @@ impl MarketTarget {
         }
     }
 
+    /// Return the Polymarket RTDS Chainlink symbol when the public stream supports it.
+    #[must_use]
+    pub const fn polymarket_chainlink_symbol(self) -> Option<&'static str> {
+        match self {
+            Self::Btc5m | Self::Btc15m => Some("btc/usd"),
+            Self::Eth5m | Self::Eth15m => Some("eth/usd"),
+            Self::Sol5m => Some("sol/usd"),
+            Self::Xrp5m => Some("xrp/usd"),
+            Self::Bnb5m => None,
+        }
+    }
+
     /// Return the window length in seconds.
     #[must_use]
     pub const fn window_secs(self) -> i64 {
@@ -171,6 +183,7 @@ impl FromStr for MarketTarget {
 #[serde(rename_all = "snake_case")]
 pub enum TargetPriceSource {
     PolymarketEventMetadata,
+    ChainlinkRtdsWindowOpen,
     #[default]
     BinanceWindowOpenFallback,
 }
@@ -181,14 +194,18 @@ impl TargetPriceSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PolymarketEventMetadata => "polymarket",
+            Self::ChainlinkRtdsWindowOpen => "chainlink_rtds",
             Self::BinanceWindowOpenFallback => "binance_fallback",
         }
     }
 
-    /// Return `true` when the target price came from Polymarket itself.
+    /// Return `true` when the target price came from an explicit oracle/market source.
     #[must_use]
     pub const fn is_explicit(self) -> bool {
-        matches!(self, Self::PolymarketEventMetadata)
+        matches!(
+            self,
+            Self::PolymarketEventMetadata | Self::ChainlinkRtdsWindowOpen
+        )
     }
 }
 
@@ -439,13 +456,8 @@ pub enum PaperOutcomeSide {
     Unknown,
 }
 
-pub(crate) const PAPER_OUTCOME_UP_LABEL_RU: &str = "\u{420}\u{43e}\u{441}\u{442}";
-pub(crate) const PAPER_OUTCOME_DOWN_LABEL_RU: &str =
-    "\u{41f}\u{430}\u{434}\u{435}\u{43d}\u{438}\u{435}";
 const PAPER_OUTCOME_UP_LABEL_RU_LOWER: &str = "\u{440}\u{43e}\u{441}\u{442}";
 const PAPER_OUTCOME_DOWN_LABEL_RU_LOWER: &str = "\u{43f}\u{430}\u{434}\u{435}\u{43d}\u{438}\u{435}";
-const PAPER_OUTCOME_UNKNOWN_LABEL_RU: &str =
-    "\u{41d}\u{435}\u{438}\u{437}\u{432}\u{435}\u{441}\u{442}\u{43d}\u{43e}";
 
 impl PaperOutcomeSide {
     /// Parse a market outcome label into a normalized side.
@@ -458,13 +470,13 @@ impl PaperOutcomeSide {
         }
     }
 
-    /// Return a compact human-readable label.
+    /// Return a compact ASCII label for logs and journals.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Up => PAPER_OUTCOME_UP_LABEL_RU,
-            Self::Down => PAPER_OUTCOME_DOWN_LABEL_RU,
-            Self::Unknown => PAPER_OUTCOME_UNKNOWN_LABEL_RU,
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::Unknown => "Unknown",
         }
     }
 }
