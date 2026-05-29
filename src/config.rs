@@ -5273,7 +5273,8 @@ mod tests {
                 MarketTarget::Btc5m,
                 MarketTarget::Eth5m,
                 MarketTarget::Sol5m,
-                MarketTarget::Xrp5m
+                MarketTarget::Xrp5m,
+                MarketTarget::Bnb5m
             ]
         );
         assert!(config.strategy.codex_scalp_probe_v1_raw_ablation_enabled);
@@ -5286,7 +5287,7 @@ mod tests {
             config.strategy.codex_scalp_probe_v1_max_entry_price,
             Decimal::new(68, 2)
         );
-        assert_eq!(config.strategy.codex_scalp_probe_v1_min_seconds_left, 60);
+        assert_eq!(config.strategy.codex_scalp_probe_v1_min_seconds_left, 45);
         assert_eq!(config.strategy.codex_scalp_probe_v1_max_seconds_left, 295);
         assert_eq!(
             config.strategy.codex_scalp_probe_v1_notional_usdc,
@@ -5296,7 +5297,7 @@ mod tests {
         assert!(config.run.allow_repeat_entries_same_window);
         assert_eq!(config.run.repeat_entry_min_interval_ms, 500);
         assert!(!config.run.revalidate_before_execute);
-        assert_eq!(config.run.execute_top_n, 2);
+        assert_eq!(config.run.execute_top_n, 3);
         assert!(config.run.early_exit.enabled);
         assert!(config.run.early_exit.scalp_exit_enabled);
         assert_eq!(

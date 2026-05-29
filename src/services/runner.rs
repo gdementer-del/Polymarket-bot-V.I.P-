@@ -27,8 +27,8 @@ use crate::config::{
 };
 use crate::error::{AppError, Result};
 use crate::models::{
-    BinaryMarket, BookFillLevel, ExecutionReport, Opportunity, OpportunityKind, OrderBook,
-    PaperOutcomeSide, PaperPosition, PaperPositionLeg, PaperState,
+    BinaryMarket, BookFillLevel, ExecutionReport, MarketTarget, Opportunity, OpportunityKind,
+    OrderBook, PaperOutcomeSide, PaperPosition, PaperPositionLeg, PaperState,
 };
 
 use self::cycle_summary::{
@@ -1447,7 +1447,7 @@ async fn prewarm_runtime_polymarket_stream(config: &AppConfig, data_client: &Mar
         return;
     }
 
-    match fetch_current_live_markets(config, data_client).await {
+    match fetch_current_live_markets(data_client, &config.strategy.market_targets).await {
         Ok(markets) if markets.is_empty() => {
             warn!("Polymarket stream prewarm found no current live markets");
         }
@@ -1565,7 +1565,7 @@ fn select_opportunities_for_regime(
             reason: Some(if adaptive_enabled {
                 "-".to_owned()
             } else {
-                "adaptive_regime :".to_owned()
+                "adaptive regime disabled".to_owned()
             }),
             selected: Vec::new(),
         };
@@ -1574,7 +1574,7 @@ fn select_opportunities_for_regime(
     if !config.run.adaptive_regime.enabled {
         return RegimeSelection {
             regime: RuntimeRegime::Aggressive,
-            reason: Some("adaptive_regime ,".to_owned()),
+            reason: Some("adaptive regime disabled".to_owned()),
             selected: base.into_iter().take(config.run.execute_top_n).collect(),
         };
     }
@@ -8847,7 +8847,9 @@ async fn collect_reactive_market_snapshot(
     open_position_slugs: &[String],
     reactive_snapshot_cache: &mut ReactiveMarketSnapshotCache,
 ) -> Result<MarketSnapshot> {
-    let runtime_markets = fetch_current_live_markets(config, data_client).await?;
+    let lookup_targets =
+        runtime_market_targets_for_trigger(&config.strategy.market_targets, trigger);
+    let runtime_markets = fetch_current_live_markets(data_client, &lookup_targets).await?;
     if config.run.polymarket_stream.enabled {
         data_client.register_live_markets(&runtime_markets).await;
     }
@@ -8927,12 +8929,49 @@ fn filter_markets_for_runtime_trigger(
 }
 
 async fn fetch_current_live_markets(
-    config: &AppConfig,
     data_client: &MarketDataClient,
+    targets: &[MarketTarget],
 ) -> Result<Vec<BinaryMarket>> {
-    data_client
-        .fetch_cached_current_live_markets(&config.strategy.market_targets)
-        .await
+    data_client.fetch_cached_current_live_markets(targets).await
+}
+
+fn runtime_market_targets_for_trigger(
+    configured_targets: &[MarketTarget],
+    trigger: Option<&RuntimeTriggerEvent>,
+) -> Vec<MarketTarget> {
+    let configured = dedupe_market_targets(configured_targets);
+    let Some(trigger) = trigger else {
+        return configured;
+    };
+    if !trigger.source.starts_with("Binance::") && !trigger.source.starts_with("Coinbase::") {
+        return configured;
+    }
+
+    let normalized_symbol = trigger.symbol.to_ascii_uppercase();
+    let filtered = configured
+        .iter()
+        .copied()
+        .filter(|target| {
+            target
+                .binance_symbol()
+                .eq_ignore_ascii_case(normalized_symbol.as_str())
+        })
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        configured
+    } else {
+        filtered
+    }
+}
+
+fn dedupe_market_targets(targets: &[MarketTarget]) -> Vec<MarketTarget> {
+    let mut deduped = Vec::with_capacity(targets.len());
+    for target in targets {
+        if !deduped.contains(target) {
+            deduped.push(*target);
+        }
+    }
+    deduped
 }
 
 async fn collect_market_snapshot_for_markets(
@@ -11135,6 +11174,45 @@ mod tests {
                 first_entry_at + StdDuration::from_millis(500),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_market_targets_follow_exchange_trigger_symbol() {
+        let configured = vec![
+            MarketTarget::Btc5m,
+            MarketTarget::Eth5m,
+            MarketTarget::Sol5m,
+            MarketTarget::Xrp5m,
+        ];
+        let trigger = RuntimeTriggerEvent {
+            symbol: "ETHUSDT".to_owned(),
+            event_time_ms: 1_000,
+            received_time_ms: 1_001,
+            price: decimal("3500"),
+            source: "Binance::Trade".to_owned(),
+        };
+
+        assert_eq!(
+            runtime_market_targets_for_trigger(&configured, Some(&trigger)),
+            vec![MarketTarget::Eth5m]
+        );
+    }
+
+    #[test]
+    fn runtime_market_targets_keep_all_for_polymarket_trigger() {
+        let configured = vec![MarketTarget::Btc5m, MarketTarget::Eth5m];
+        let trigger = RuntimeTriggerEvent {
+            symbol: String::new(),
+            event_time_ms: 1_000,
+            received_time_ms: 1_001,
+            price: Decimal::ZERO,
+            source: "Polymarket::Book".to_owned(),
+        };
+
+        assert_eq!(
+            runtime_market_targets_for_trigger(&configured, Some(&trigger)),
+            configured
         );
     }
 

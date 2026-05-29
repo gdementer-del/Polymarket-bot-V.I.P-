@@ -1498,9 +1498,15 @@ impl BundleArbitrageStrategy {
     ) -> Option<Opportunity> {
         let primary = quote_for_side(quotes, decision.up_side);
         let primary_book = order_book_for_side(decision.up_side, book_refs);
-        let max_entry_price = bonereaper_state_v2_variant_max_entry_price(kind, &self.config);
         let raw_scalp_ablation = kind == OpportunityKind::CodexScalpProbeV1
             && self.config.codex_scalp_probe_v1_raw_ablation_enabled;
+        let raw_light_profile = (kind == OpportunityKind::CodexScalpProbeV1
+            && codex_scalp_probe_v1_raw_light_mode(&self.config))
+        .then(|| codex_scalp_probe_v1_raw_light_profile(context.target));
+        let max_entry_price = raw_light_profile.map_or_else(
+            || bonereaper_state_v2_variant_max_entry_price(kind, &self.config),
+            |profile| profile.hot_max_entry_price,
+        );
         if !is_valid_binary_price(primary.ask_price)
             || (!raw_scalp_ablation && primary.ask_price > max_entry_price)
         {
@@ -2866,7 +2872,7 @@ impl BundleArbitrageStrategy {
         } else {
             raw_light_profile.map_or(
                 self.config.codex_scalp_probe_v1_max_entry_price,
-                |profile| profile.max_entry_price,
+                |profile| profile.hot_max_entry_price,
             )
         };
         let max_book_age_ms = if use_bnb_pressure_thresholds {
@@ -3126,8 +3132,16 @@ impl BundleArbitrageStrategy {
                 && aligned_micro_or_swing >= profile.cheap_min_aligned_bps
                 && aligned_top_bps >= Decimal::ZERO
                 && aligned_depth_bps >= Decimal::ZERO;
+            let hot_momentum_lane = primary.ask_price > profile.max_entry_price
+                && primary.ask_price <= profile.hot_max_entry_price
+                && decision.signal_strength_bps >= profile.hot_min_signal_bps
+                && target_gap_abs >= profile.hot_min_target_gap_bps
+                && radar.fresh_confirmation_bps >= profile.hot_min_fresh_bps
+                && aligned_micro_or_swing >= profile.hot_min_aligned_bps
+                && aligned_top_bps >= profile.hot_min_top_imbalance_bps
+                && aligned_depth_bps >= profile.hot_min_depth_imbalance_bps;
 
-            if normal_lane || cheap_lottery_lane {
+            if normal_lane || cheap_lottery_lane || hot_momentum_lane {
                 return Some(scored_near_miss(
                     market,
                     context,
@@ -3142,9 +3156,9 @@ impl BundleArbitrageStrategy {
                 ));
             }
 
-            if primary.ask_price > profile.max_entry_price {
+            if primary.ask_price > profile.hot_max_entry_price {
                 let shortfall_bps =
-                    decimal_to_bps_ceil(primary.ask_price - profile.max_entry_price);
+                    decimal_to_bps_ceil(primary.ask_price - profile.hot_max_entry_price);
                 return Some(scored_near_miss(
                     market,
                     context,
@@ -5778,6 +5792,7 @@ fn codex_scalp_probe_v1_standard_allows(
 struct CodexScalpProbeRawLightProfile {
     min_entry_price: Decimal,
     max_entry_price: Decimal,
+    hot_max_entry_price: Decimal,
     max_target_gap_bps: Decimal,
     cheap_entry_price: Decimal,
     min_signal_bps: Decimal,
@@ -5790,6 +5805,12 @@ struct CodexScalpProbeRawLightProfile {
     cheap_min_signal_bps: Decimal,
     cheap_min_target_gap_bps: Decimal,
     cheap_min_aligned_bps: Decimal,
+    hot_min_signal_bps: Decimal,
+    hot_min_target_gap_bps: Decimal,
+    hot_min_fresh_bps: Decimal,
+    hot_min_aligned_bps: Decimal,
+    hot_min_top_imbalance_bps: Decimal,
+    hot_min_depth_imbalance_bps: Decimal,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5798,6 +5819,7 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
         MarketTarget::Btc5m => CodexScalpProbeRawLightProfile {
             min_entry_price: Decimal::new(50, 2),
             max_entry_price: Decimal::new(68, 2),
+            hot_max_entry_price: Decimal::new(82, 2),
             max_target_gap_bps: Decimal::new(1200, 2),
             cheap_entry_price: Decimal::new(12, 2),
             min_signal_bps: Decimal::from(12_u32),
@@ -5810,10 +5832,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_signal_bps: Decimal::from(15_u32),
             cheap_min_target_gap_bps: Decimal::new(300, 2),
             cheap_min_aligned_bps: Decimal::new(400, 2),
+            hot_min_signal_bps: Decimal::from(20_u32),
+            hot_min_target_gap_bps: Decimal::new(300, 2),
+            hot_min_fresh_bps: Decimal::new(700, 2),
+            hot_min_aligned_bps: Decimal::new(800, 2),
+            hot_min_top_imbalance_bps: Decimal::from(5_000_u32),
+            hot_min_depth_imbalance_bps: Decimal::from(3_500_u32),
         },
         MarketTarget::Eth5m => CodexScalpProbeRawLightProfile {
             min_entry_price: Decimal::new(45, 2),
             max_entry_price: Decimal::new(62, 2),
+            hot_max_entry_price: Decimal::new(76, 2),
             max_target_gap_bps: Decimal::new(1400, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(22_u32),
@@ -5826,10 +5855,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_signal_bps: Decimal::from(24_u32),
             cheap_min_target_gap_bps: Decimal::new(600, 2),
             cheap_min_aligned_bps: Decimal::new(700, 2),
+            hot_min_signal_bps: Decimal::from(30_u32),
+            hot_min_target_gap_bps: Decimal::new(800, 2),
+            hot_min_fresh_bps: Decimal::new(800, 2),
+            hot_min_aligned_bps: Decimal::new(1000, 2),
+            hot_min_top_imbalance_bps: Decimal::from(5_000_u32),
+            hot_min_depth_imbalance_bps: Decimal::from(3_500_u32),
         },
         MarketTarget::Sol5m => CodexScalpProbeRawLightProfile {
             min_entry_price: Decimal::new(45, 2),
             max_entry_price: Decimal::new(62, 2),
+            hot_max_entry_price: Decimal::new(76, 2),
             max_target_gap_bps: Decimal::new(1400, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(20_u32),
@@ -5842,10 +5878,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_signal_bps: Decimal::from(22_u32),
             cheap_min_target_gap_bps: Decimal::new(600, 2),
             cheap_min_aligned_bps: Decimal::new(700, 2),
+            hot_min_signal_bps: Decimal::from(28_u32),
+            hot_min_target_gap_bps: Decimal::new(800, 2),
+            hot_min_fresh_bps: Decimal::new(800, 2),
+            hot_min_aligned_bps: Decimal::new(1000, 2),
+            hot_min_top_imbalance_bps: Decimal::from(4_500_u32),
+            hot_min_depth_imbalance_bps: Decimal::from(1_500_u32),
         },
         MarketTarget::Xrp5m => CodexScalpProbeRawLightProfile {
             min_entry_price: Decimal::new(40, 2),
             max_entry_price: Decimal::new(58, 2),
+            hot_max_entry_price: Decimal::new(74, 2),
             max_target_gap_bps: Decimal::new(1200, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(22_u32),
@@ -5858,10 +5901,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_signal_bps: Decimal::from(22_u32),
             cheap_min_target_gap_bps: Decimal::new(500, 2),
             cheap_min_aligned_bps: Decimal::new(700, 2),
+            hot_min_signal_bps: Decimal::from(30_u32),
+            hot_min_target_gap_bps: Decimal::new(800, 2),
+            hot_min_fresh_bps: Decimal::new(800, 2),
+            hot_min_aligned_bps: Decimal::new(1000, 2),
+            hot_min_top_imbalance_bps: Decimal::from(4_500_u32),
+            hot_min_depth_imbalance_bps: Decimal::from(2_000_u32),
         },
         MarketTarget::Bnb5m => CodexScalpProbeRawLightProfile {
             min_entry_price: Decimal::new(45, 2),
             max_entry_price: Decimal::new(62, 2),
+            hot_max_entry_price: Decimal::new(78, 2),
             max_target_gap_bps: Decimal::new(1000, 2),
             cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(8_u32),
@@ -5874,10 +5924,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_signal_bps: Decimal::from(10_u32),
             cheap_min_target_gap_bps: Decimal::new(350, 2),
             cheap_min_aligned_bps: Decimal::new(250, 2),
+            hot_min_signal_bps: Decimal::from(14_u32),
+            hot_min_target_gap_bps: Decimal::new(400, 2),
+            hot_min_fresh_bps: Decimal::new(400, 2),
+            hot_min_aligned_bps: Decimal::new(600, 2),
+            hot_min_top_imbalance_bps: Decimal::from(2_500_u32),
+            hot_min_depth_imbalance_bps: Decimal::from(1_500_u32),
         },
         MarketTarget::Btc15m | MarketTarget::Eth15m => CodexScalpProbeRawLightProfile {
             min_entry_price: Decimal::MAX,
             max_entry_price: Decimal::ZERO,
+            hot_max_entry_price: Decimal::ZERO,
             max_target_gap_bps: Decimal::ZERO,
             cheap_entry_price: Decimal::ZERO,
             min_signal_bps: Decimal::MAX,
@@ -5890,6 +5947,12 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             cheap_min_signal_bps: Decimal::MAX,
             cheap_min_target_gap_bps: Decimal::MAX,
             cheap_min_aligned_bps: Decimal::MAX,
+            hot_min_signal_bps: Decimal::MAX,
+            hot_min_target_gap_bps: Decimal::MAX,
+            hot_min_fresh_bps: Decimal::MAX,
+            hot_min_aligned_bps: Decimal::MAX,
+            hot_min_top_imbalance_bps: Decimal::MAX,
+            hot_min_depth_imbalance_bps: Decimal::MAX,
         },
     }
 }
@@ -5908,7 +5971,9 @@ fn codex_scalp_probe_v1_raw_light_allows(
     }
 
     let profile = codex_scalp_probe_v1_raw_light_profile(context.target);
-    if primary_ask_price < profile.min_entry_price || primary_ask_price > profile.max_entry_price {
+    if primary_ask_price < profile.min_entry_price
+        || primary_ask_price > profile.hot_max_entry_price
+    {
         return false;
     }
 
@@ -5974,7 +6039,16 @@ fn codex_scalp_probe_v1_raw_light_allows(
         && aligned_top_bps >= Decimal::ZERO
         && aligned_depth_bps >= Decimal::ZERO;
 
-    normal_lane || cheap_lottery_lane
+    let hot_momentum_lane = primary_ask_price > profile.max_entry_price
+        && primary_ask_price <= profile.hot_max_entry_price
+        && decision.signal_strength_bps >= profile.hot_min_signal_bps
+        && target_gap_abs >= profile.hot_min_target_gap_bps
+        && fresh_confirmation_bps >= profile.hot_min_fresh_bps
+        && aligned_micro_or_swing >= profile.hot_min_aligned_bps
+        && aligned_top_bps >= profile.hot_min_top_imbalance_bps
+        && aligned_depth_bps >= profile.hot_min_depth_imbalance_bps;
+
+    normal_lane || cheap_lottery_lane || hot_momentum_lane
 }
 
 fn codex_scalp_probe_v1_raw_light_mode(config: &StrategyConfig) -> bool {
@@ -8257,6 +8331,94 @@ mod tests {
             &context,
             &decision,
             decimal("0.60"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_allows_hot_momentum_chase() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("9.00", "9.00");
+        context.target = MarketTarget::Btc5m;
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(25);
+        context.exchange_book_age_ms = Some(20);
+        context.exchange_book_top_imbalance_bps = Decimal::from(5_800);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(4_200);
+        context.exchange_book_spread_bps = decimal("0.40");
+        context.spot_move_1s_bps = decimal("7.50");
+        let mut decision = test_codex_decision("9.00", "9.00");
+        decision.signal_strength_bps = Decimal::from(24);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.73"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.76"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.76"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_blocks_weak_hot_chase() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("9.00", "9.00");
+        context.target = MarketTarget::Btc5m;
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(25);
+        context.exchange_book_age_ms = Some(20);
+        context.exchange_book_top_imbalance_bps = Decimal::from(900);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(900);
+        context.exchange_book_spread_bps = decimal("0.40");
+        context.spot_move_1s_bps = decimal("1.50");
+        let mut decision = test_codex_decision("9.00", "9.00");
+        decision.signal_strength_bps = Decimal::from(24);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.73"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.76"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(!codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.76"),
             &book,
             &config,
         ));

@@ -42,7 +42,8 @@ const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.c
 const POLYMARKET_MARKET_WS_RECONNECT_DELAY_MS: u64 = 300;
 const LIVE_TRADE_RETENTION_MS: i64 = 60 * 60 * 1_000;
 const MARKET_BY_SLUG_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
-const LIVE_MARKET_SET_TTL_MS: i64 = 10_000;
+const LIVE_MARKET_SET_TTL_MS: i64 = 60_000;
+const EMPTY_LIVE_MARKET_SET_TTL_MS: i64 = 5_000;
 const SERVER_TIME_TTL_MS: i64 = 30_000;
 const MARKET_BY_SLUG_CACHE_MAX_ENTRIES: usize = 512;
 const LIVE_SUBSCRIPTION_PAST_GRACE_SECS: i64 = 60;
@@ -592,7 +593,8 @@ impl MarketDataClient {
         if let Some(cached) = {
             let cache = self.live_market_set_cache.read().await;
             cache.get(&key).cloned()
-        } && local_now_ms.saturating_sub(cached.cached_at_ms) <= LIVE_MARKET_SET_TTL_MS
+        } && local_now_ms.saturating_sub(cached.cached_at_ms)
+            <= live_market_set_ttl_ms(&cached.markets)
         {
             return Ok(cached.markets);
         }
@@ -642,7 +644,8 @@ impl MarketDataClient {
             },
         );
         cache.retain(|_, entry| {
-            local_now_ms.saturating_sub(entry.cached_at_ms) <= LIVE_MARKET_SET_TTL_MS
+            local_now_ms.saturating_sub(entry.cached_at_ms)
+                <= live_market_set_ttl_ms(&entry.markets)
         });
 
         Ok(markets)
@@ -1959,15 +1962,24 @@ where
     }
 }
 
+fn live_market_set_ttl_ms(markets: &[BinaryMarket]) -> i64 {
+    if markets.is_empty() {
+        EMPTY_LIVE_MARKET_SET_TTL_MS
+    } else {
+        LIVE_MARKET_SET_TTL_MS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
 
-    use crate::models::{BookLevel, MarketTarget, OrderBook};
+    use crate::models::{BinaryMarket, BookLevel, MarketTarget, OrderBook, TargetPriceSource};
 
     use super::{
-        CachedServerTime, ProfileActivityRecord, TradeFlowSummary, TradeRecord,
-        generate_target_market_slugs, live_subscription_slug_is_relevant, normalize_book_sides,
+        CachedServerTime, EMPTY_LIVE_MARKET_SET_TTL_MS, LIVE_MARKET_SET_TTL_MS,
+        ProfileActivityRecord, TradeFlowSummary, TradeRecord, generate_target_market_slugs,
+        live_market_set_ttl_ms, live_subscription_slug_is_relevant, normalize_book_sides,
         parse_supported_window_slug, prioritize_target_event_slugs_at,
         project_cached_server_time_secs,
     };
@@ -2055,6 +2067,27 @@ mod tests {
             project_cached_server_time_secs(cached, 12_250),
             1_775_079_452
         );
+    }
+
+    #[test]
+    fn live_market_set_cache_keeps_hits_longer_than_misses() {
+        let market = BinaryMarket {
+            condition_id: "cond".to_owned(),
+            slug: "btc-updown-5m-1775079300".to_owned(),
+            question: "BTC Up or Down".to_owned(),
+            outcome_a_label: "Up".to_owned(),
+            outcome_a_token_id: "up".to_owned(),
+            outcome_b_label: "Down".to_owned(),
+            outcome_b_token_id: "down".to_owned(),
+            end_date: None,
+            liquidity_usdc: Decimal::ZERO,
+            target_price: None,
+            target_price_source: Some(TargetPriceSource::BinanceWindowOpenFallback),
+            final_reference_price: None,
+        };
+
+        assert_eq!(live_market_set_ttl_ms(&[]), EMPTY_LIVE_MARKET_SET_TTL_MS);
+        assert_eq!(live_market_set_ttl_ms(&[market]), LIVE_MARKET_SET_TTL_MS);
     }
 
     #[test]

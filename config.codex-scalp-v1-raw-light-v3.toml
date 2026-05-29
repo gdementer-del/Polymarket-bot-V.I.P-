@@ -19,7 +19,7 @@ page_size = 200
 books_batch_size = 100
 
 [strategy]
-market_targets = ["btc-5m", "eth-5m", "sol-5m", "xrp-5m"]
+market_targets = ["btc-5m", "eth-5m", "sol-5m", "xrp-5m", "bnb-5m"]
 enable_bundle = false
 min_edge_bps = 0
 assumed_fee_bps = 100
@@ -64,7 +64,7 @@ codex_scalp_probe_v1_max_entry_price = "0.68"
 codex_scalp_probe_v1_max_entry_spread = "0.20"
 codex_scalp_probe_v1_min_elapsed_window_secs = 0
 codex_scalp_probe_v1_max_seconds_left = 295
-codex_scalp_probe_v1_min_seconds_left = 60
+codex_scalp_probe_v1_min_seconds_left = 45
 codex_scalp_probe_v1_max_book_age_ms = 1000
 codex_scalp_probe_v1_max_exchange_spread_bps = "10.00"
 codex_scalp_probe_v1_min_target_gap_bps = "0.00"
@@ -136,7 +136,7 @@ reactive_idle_secs = 0
 allow_repeat_entries_same_window = true
 repeat_entry_min_interval_ms = 500
 revalidate_before_execute = false
-execute_top_n = 2
+execute_top_n = 3
 
 [run.polymarket_stream]
 enabled = true
