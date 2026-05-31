@@ -39,9 +39,11 @@ use super::analytics::AnalyticsReport;
 use super::backtest::{BacktestReport, BacktestRunner, BacktestSignal};
 use super::binance::{
     BinanceClient, BinanceTriggerEvent, BinanceTriggerSource, BtcFiveMinuteContext,
-    LiveMarketDataHealth, MarketWindowResolution, WindowDirection,
+    LiveMarketDataHealth, LiveSpotPricePoint, LiveSpotPriceView, MarketWindowResolution,
+    WindowDirection,
 };
-use super::coinbase::CoinbaseClient;
+use super::chainlink::{ChainlinkOraclePriceView, ChainlinkOracleTriggerEvent};
+use super::coinbase::{CoinbaseClient, CoinbaseTickerPriceView};
 use super::execution::{
     AuthCheckReport, LiveExecutor, MAX_MARK_TO_MARKET_BID_LEVELS, PaperCloseReport, PaperCostModel,
     PaperExecutor, TradeExecutor, mark_to_market_payout_for_legs,
@@ -111,6 +113,16 @@ impl RuntimeTriggerEvent {
             received_time_ms: event.received_time_ms,
             price: event.price,
             source,
+        }
+    }
+
+    fn from_chainlink(event: ChainlinkOracleTriggerEvent) -> Self {
+        Self {
+            symbol: event.symbol,
+            event_time_ms: event.event_time_ms,
+            received_time_ms: event.received_time_ms,
+            price: event.price,
+            source: "Chainlink::RTDS".to_owned(),
         }
     }
 
@@ -276,6 +288,19 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 &binance_client,
                 &strategy,
                 top,
+                refresh_secs,
+                cycles,
+            )
+            .await
+        }
+        Command::PriceMonitor {
+            refresh_secs,
+            cycles,
+        } => {
+            run_price_monitor(
+                &config,
+                &binance_client,
+                coinbase_client.as_ref(),
                 refresh_secs,
                 cycles,
             )
@@ -1442,6 +1467,158 @@ fn start_runtime_market_streams(
     }
 }
 
+fn start_price_monitor_streams(
+    config: &AppConfig,
+    binance_client: &BinanceClient,
+    coinbase_client: Option<&CoinbaseClient>,
+) {
+    for symbol in configured_binance_symbols(config) {
+        if binance_client.start_trade_stream(symbol) {
+            info!(symbol, "started Binance price stream for price monitor");
+        } else {
+            warn!(
+                symbol,
+                "failed to start Binance price stream for price monitor"
+            );
+        }
+    }
+
+    if let Some(coinbase_client) = coinbase_client {
+        for target in configured_market_targets(config) {
+            if coinbase_client.start_ticker_stream(target) {
+                info!(
+                    product_id = target.coinbase_product_id(),
+                    symbol = target.binance_symbol(),
+                    "started Coinbase price stream for price monitor"
+                );
+            } else {
+                warn!(
+                    product_id = target.coinbase_product_id(),
+                    "failed to start Coinbase price stream for price monitor"
+                );
+            }
+        }
+    }
+
+    if config.run.chainlink_oracle.enabled {
+        let targets = configured_market_targets(config);
+        if binance_client.start_chainlink_oracle_stream(
+            config.http.polymarket_rtds_ws_url.clone(),
+            &targets,
+            config.run.chainlink_oracle,
+        ) {
+            info!("started Chainlink RTDS price stream for price monitor");
+        } else {
+            warn!("failed to start Chainlink RTDS price stream for price monitor");
+        }
+    }
+}
+
+async fn run_price_monitor(
+    config: &AppConfig,
+    binance_client: &BinanceClient,
+    coinbase_client: Option<&CoinbaseClient>,
+    refresh_secs: u64,
+    cycles: Option<usize>,
+) -> Result<()> {
+    let refresh_secs = refresh_secs.max(1);
+    let symbols = configured_binance_symbols(config);
+    let targets = configured_market_targets(config);
+    start_price_monitor_streams(config, binance_client, coinbase_client);
+    println!(
+        "started realtime price monitor: symbols={}, targets={}, heartbeat={}s",
+        symbols.len(),
+        targets.len(),
+        refresh_secs
+    );
+
+    let mut exchange_rx = binance_client.subscribe_triggers();
+    let mut chainlink_rx = config
+        .run
+        .chainlink_oracle
+        .enabled
+        .then(|| binance_client.subscribe_chainlink_triggers());
+    let heartbeat = Duration::from_secs(refresh_secs);
+    let mut completed_cycles = 0_usize;
+    loop {
+        let trigger =
+            wait_for_price_monitor_trigger(&mut exchange_rx, chainlink_rx.as_mut(), heartbeat)
+                .await;
+        let spot_views = binance_client.live_spot_price_views(&symbols).await;
+        let chainlink_views = binance_client.chainlink_price_views(&targets).await;
+        let coinbase_views = coinbase_client
+            .map(CoinbaseClient::latest_ticker_price_views)
+            .unwrap_or_default();
+
+        if let Some(trigger) = trigger.as_ref() {
+            if !is_price_monitor_display_trigger(trigger) {
+                continue;
+            }
+            println!(
+                "{}",
+                render_price_monitor_event_line(
+                    trigger,
+                    &targets,
+                    &spot_views,
+                    &coinbase_views,
+                    &chainlink_views,
+                )
+            );
+        } else {
+            println!(
+                "{}",
+                render_price_monitor_table(&spot_views, &coinbase_views, &chainlink_views)
+            );
+        }
+        let _ = io::stdout().flush();
+
+        completed_cycles += 1;
+        if cycles.is_some_and(|limit| completed_cycles >= limit) {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_price_monitor_trigger(
+    exchange_rx: &mut watch::Receiver<Option<BinanceTriggerEvent>>,
+    chainlink_rx: Option<&mut watch::Receiver<Option<ChainlinkOracleTriggerEvent>>>,
+    heartbeat: Duration,
+) -> Option<RuntimeTriggerEvent> {
+    match chainlink_rx {
+        Some(chainlink_rx) => {
+            tokio::select! {
+                changed = exchange_rx.changed() => {
+                    changed.ok()?;
+                    exchange_rx
+                        .borrow_and_update()
+                        .clone()
+                        .map(RuntimeTriggerEvent::from_binance)
+                }
+                changed = chainlink_rx.changed() => {
+                    changed.ok()?;
+                    chainlink_rx
+                        .borrow_and_update()
+                        .clone()
+                        .map(RuntimeTriggerEvent::from_chainlink)
+                }
+                _ = sleep(heartbeat) => None,
+            }
+        }
+        None => {
+            tokio::select! {
+                changed = exchange_rx.changed() => {
+                    changed.ok()?;
+                    exchange_rx
+                        .borrow_and_update()
+                        .clone()
+                        .map(RuntimeTriggerEvent::from_binance)
+                }
+                _ = sleep(heartbeat) => None,
+            }
+        }
+    }
+}
+
 async fn prewarm_runtime_polymarket_stream(config: &AppConfig, data_client: &MarketDataClient) {
     if !config.run.polymarket_stream.enabled {
         return;
@@ -1531,6 +1708,192 @@ fn format_live_market_data_health(health: &[LiveMarketDataHealth]) -> String {
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+fn render_price_monitor_table(
+    spot_views: &[LiveSpotPriceView],
+    coinbase_views: &[CoinbaseTickerPriceView],
+    chainlink_views: &[ChainlinkOraclePriceView],
+) -> String {
+    let coinbase_by_symbol = coinbase_views
+        .iter()
+        .map(|view| (view.symbol.as_str(), view))
+        .collect::<HashMap<_, _>>();
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "price monitor @ {}",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    let _ = writeln!(output, "Exchange feeds:");
+    for view in spot_views {
+        let raw_coinbase = coinbase_by_symbol.get(view.symbol.as_str()).copied();
+        let raw_coinbase_gap = view.binance_trade.and_then(|binance| {
+            raw_coinbase.and_then(|coinbase| price_gap_bps(coinbase.price, binance.price))
+        });
+        let _ = writeln!(
+            output,
+            "  {} | Binance={} | CoinbaseRaw={} | CoinbaseAccepted={} | cb_vs_binance={} | depth_age={} | points={}",
+            view.symbol,
+            format_live_spot_price_point(view.binance_trade),
+            format_coinbase_ticker_price(raw_coinbase),
+            format_live_spot_price_point(view.coinbase_ticker),
+            format_optional_bps(raw_coinbase_gap),
+            format_optional_ms(view.depth_age_ms),
+            view.quote_points
+        );
+    }
+
+    let _ = writeln!(output, "Chainlink RTDS:");
+    for view in chainlink_views {
+        let symbol = view.symbol.unwrap_or("unsupported");
+        let price = view.quote.map_or_else(
+            || "waiting".to_owned(),
+            |quote| format_price_with_ages(quote.price, quote.event_age_ms, quote.received_age_ms),
+        );
+        let _ = writeln!(output, "  {} {} | {}", view.target.label(), symbol, price);
+    }
+
+    output
+}
+
+fn render_price_monitor_event_line(
+    trigger: &RuntimeTriggerEvent,
+    targets: &[MarketTarget],
+    spot_views: &[LiveSpotPriceView],
+    coinbase_views: &[CoinbaseTickerPriceView],
+    chainlink_views: &[ChainlinkOraclePriceView],
+) -> String {
+    let display_symbol = price_monitor_display_symbol(trigger, targets);
+    let spot_view = spot_views
+        .iter()
+        .find(|view| view.symbol == display_symbol)
+        .or_else(|| spot_views.iter().find(|view| view.symbol == trigger.symbol));
+    let raw_coinbase = coinbase_views
+        .iter()
+        .find(|view| view.symbol == display_symbol)
+        .or_else(|| {
+            coinbase_views
+                .iter()
+                .find(|view| view.symbol == trigger.symbol)
+        });
+    let chainlink_view = price_monitor_chainlink_view(trigger, targets, chainlink_views);
+    let raw_coinbase_gap = spot_view.and_then(|view| {
+        view.binance_trade.and_then(|binance| {
+            raw_coinbase.and_then(|coinbase| price_gap_bps(coinbase.price, binance.price))
+        })
+    });
+    let chainlink_gap = spot_view.and_then(|view| {
+        view.binance_trade.and_then(|binance| {
+            chainlink_view.and_then(|chainlink| {
+                chainlink
+                    .quote
+                    .and_then(|quote| price_gap_bps(quote.price, binance.price))
+            })
+        })
+    });
+
+    format!(
+        "{} | {} {} event={} event_age={}ms recv_age={}ms | binance={} | cb_raw={} | cb_accepted={} | chainlink={} | cb_gap={} | chainlink_gap={} | depth={}",
+        Local::now().format("%H:%M:%S%.3f"),
+        trigger.source,
+        trigger.symbol,
+        trigger.price.round_dp(4),
+        trigger.event_age_ms(),
+        trigger.received_age_ms(),
+        format_live_spot_price_point(spot_view.and_then(|view| view.binance_trade)),
+        format_coinbase_ticker_price(raw_coinbase),
+        format_live_spot_price_point(spot_view.and_then(|view| view.coinbase_ticker)),
+        format_chainlink_price_view(chainlink_view),
+        format_optional_bps(raw_coinbase_gap),
+        format_optional_bps(chainlink_gap),
+        format_optional_ms(spot_view.and_then(|view| view.depth_age_ms))
+    )
+}
+
+fn is_price_monitor_display_trigger(trigger: &RuntimeTriggerEvent) -> bool {
+    matches!(
+        trigger.source.as_str(),
+        "Binance::Trade" | "Binance::OneSecondKline" | "Coinbase::Ticker" | "Chainlink::RTDS"
+    )
+}
+
+fn price_monitor_display_symbol(trigger: &RuntimeTriggerEvent, targets: &[MarketTarget]) -> String {
+    if trigger.source == "Chainlink::RTDS" {
+        targets
+            .iter()
+            .find(|target| target.polymarket_chainlink_symbol() == Some(trigger.symbol.as_str()))
+            .map_or_else(
+                || trigger.symbol.clone(),
+                |target| target.binance_symbol().to_owned(),
+            )
+    } else {
+        trigger.symbol.clone()
+    }
+}
+
+fn price_monitor_chainlink_view<'a>(
+    trigger: &RuntimeTriggerEvent,
+    targets: &[MarketTarget],
+    chainlink_views: &'a [ChainlinkOraclePriceView],
+) -> Option<&'a ChainlinkOraclePriceView> {
+    if trigger.source == "Chainlink::RTDS" {
+        return chainlink_views
+            .iter()
+            .find(|view| view.symbol == Some(trigger.symbol.as_str()));
+    }
+
+    let target = targets
+        .iter()
+        .find(|target| target.binance_symbol() == trigger.symbol)?;
+    chainlink_views.iter().find(|view| view.target == *target)
+}
+
+fn format_live_spot_price_point(point: Option<LiveSpotPricePoint>) -> String {
+    point.map_or_else(
+        || "-".to_owned(),
+        |point| format_price_with_ages(point.price, point.event_age_ms, point.received_age_ms),
+    )
+}
+
+fn format_coinbase_ticker_price(view: Option<&CoinbaseTickerPriceView>) -> String {
+    view.map_or_else(
+        || "-".to_owned(),
+        |view| format_price_with_ages(view.price, view.event_age_ms, view.received_age_ms),
+    )
+}
+
+fn format_chainlink_price_view(view: Option<&ChainlinkOraclePriceView>) -> String {
+    view.and_then(|view| view.quote).map_or_else(
+        || "-".to_owned(),
+        |quote| format_price_with_ages(quote.price, quote.event_age_ms, quote.received_age_ms),
+    )
+}
+
+fn format_price_with_ages(price: Decimal, event_age_ms: i64, received_age_ms: i64) -> String {
+    format!(
+        "{} event_age={}ms recv_age={}ms",
+        price.round_dp(4),
+        event_age_ms,
+        received_age_ms
+    )
+}
+
+fn format_optional_ms(value: Option<i64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value}ms"))
+}
+
+fn format_optional_bps(value: Option<Decimal>) -> String {
+    value.map_or_else(
+        || "-".to_owned(),
+        |value| format!("{} bps", value.round_dp(4)),
+    )
+}
+
+fn price_gap_bps(secondary_price: Decimal, primary_price: Decimal) -> Option<Decimal> {
+    (primary_price > Decimal::ZERO).then(|| {
+        ((secondary_price - primary_price) / primary_price * Decimal::from(10_000_u32)).round_dp(4)
+    })
 }
 
 #[derive(Debug, Clone)]

@@ -14,7 +14,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio::time::{interval, sleep};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -48,6 +48,31 @@ pub struct ChainlinkOracleQuote {
     pub price: Decimal,
 }
 
+/// Latest Chainlink RTDS oracle price for a configured market target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainlinkOraclePriceView {
+    pub target: MarketTarget,
+    pub symbol: Option<&'static str>,
+    pub quote: Option<ChainlinkOraclePricePoint>,
+}
+
+/// One Chainlink RTDS price point with clock-lag diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainlinkOraclePricePoint {
+    pub price: Decimal,
+    pub event_age_ms: i64,
+    pub received_age_ms: i64,
+}
+
+/// Reactive update emitted when a fresh Chainlink RTDS price arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainlinkOracleTriggerEvent {
+    pub symbol: String,
+    pub event_time_ms: i64,
+    pub received_time_ms: i64,
+    pub price: Decimal,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ChainlinkWindowCache {
     start_quote: Option<ChainlinkOracleQuote>,
@@ -68,6 +93,7 @@ pub struct ChainlinkOracleCache {
     state: Arc<RwLock<ChainlinkOracleState>>,
     settings: Arc<RwLock<ChainlinkOracleConfig>>,
     started: Arc<AtomicBool>,
+    trigger_tx: watch::Sender<Option<ChainlinkOracleTriggerEvent>>,
 }
 
 impl Default for ChainlinkOracleCache {
@@ -76,6 +102,7 @@ impl Default for ChainlinkOracleCache {
             state: Arc::new(RwLock::new(ChainlinkOracleState::default())),
             settings: Arc::new(RwLock::new(ChainlinkOracleConfig::default())),
             started: Arc::new(AtomicBool::new(false)),
+            trigger_tx: watch::channel(None).0,
         }
     }
 }
@@ -110,6 +137,48 @@ impl ChainlinkOracleCache {
         }));
 
         true
+    }
+
+    /// Subscribe to live Chainlink RTDS trigger events.
+    #[must_use]
+    pub fn subscribe_triggers(&self) -> watch::Receiver<Option<ChainlinkOracleTriggerEvent>> {
+        self.trigger_tx.subscribe()
+    }
+
+    /// Return latest Chainlink RTDS quotes for each configured target.
+    pub async fn latest_price_views(
+        &self,
+        targets: &[MarketTarget],
+    ) -> Vec<ChainlinkOraclePriceView> {
+        let now_ms = Utc::now().timestamp_millis();
+        let state = self.state.read().await;
+
+        targets
+            .iter()
+            .copied()
+            .map(|target| {
+                let symbol = target.polymarket_chainlink_symbol();
+                let quote = symbol
+                    .and_then(|symbol| {
+                        state
+                            .quotes_by_symbol
+                            .get(&normalize_chainlink_symbol(symbol))
+                    })
+                    .and_then(|quotes| quotes.back())
+                    .copied()
+                    .map(|quote| ChainlinkOraclePricePoint {
+                        price: quote.price,
+                        event_age_ms: now_ms.saturating_sub(quote.event_time_ms),
+                        received_age_ms: now_ms.saturating_sub(quote.received_time_ms),
+                    });
+
+                ChainlinkOraclePriceView {
+                    target,
+                    symbol,
+                    quote,
+                }
+            })
+            .collect()
     }
 
     async fn configure(&self, settings: ChainlinkOracleConfig) {
@@ -338,7 +407,7 @@ impl ChainlinkOracleCache {
             received_time_ms,
             price,
         };
-        self.ingest_quote(&symbol, quote).await;
+        self.ingest_quote(&symbol, quote, true).await;
         Ok(())
     }
 
@@ -350,25 +419,32 @@ impl ChainlinkOracleCache {
         }
 
         let received_time_ms = Utc::now().timestamp_millis();
+        let mut latest_quote = None;
         for point in payload.data {
             let Some(price) = valid_chainlink_price(&symbol, &point.value)? else {
                 continue;
             };
-            self.ingest_quote(
-                &symbol,
-                ChainlinkOracleQuote {
-                    event_time_ms: point.timestamp,
-                    received_time_ms,
-                    price,
-                },
-            )
-            .await;
+            let quote = ChainlinkOracleQuote {
+                event_time_ms: point.timestamp,
+                received_time_ms,
+                price,
+            };
+            if latest_quote.is_none_or(|latest: ChainlinkOracleQuote| {
+                quote.event_time_ms >= latest.event_time_ms
+            }) {
+                latest_quote = Some(quote);
+            }
+            self.ingest_quote(&symbol, quote, false).await;
+        }
+
+        if let Some(quote) = latest_quote {
+            self.emit_quote_trigger(&symbol, quote);
         }
 
         Ok(())
     }
 
-    async fn ingest_quote(&self, symbol: &str, quote: ChainlinkOracleQuote) {
+    async fn ingest_quote(&self, symbol: &str, quote: ChainlinkOracleQuote, emit_trigger: bool) {
         let symbol = normalize_chainlink_symbol(symbol);
         let mut state = self.state.write().await;
         let quotes = state
@@ -386,12 +462,26 @@ impl ChainlinkOracleCache {
         }
 
         prune_window_cache(&mut state.windows);
+        drop(state);
+
+        if emit_trigger {
+            self.emit_quote_trigger(&symbol, quote);
+        }
         debug!(
             symbol = %symbol,
             price = %quote.price,
             event_time_ms = quote.event_time_ms,
             "updated Chainlink RTDS oracle cache"
         );
+    }
+
+    fn emit_quote_trigger(&self, symbol: &str, quote: ChainlinkOracleQuote) {
+        let _ = self.trigger_tx.send(Some(ChainlinkOracleTriggerEvent {
+            symbol: normalize_chainlink_symbol(symbol),
+            event_time_ms: quote.event_time_ms,
+            received_time_ms: quote.received_time_ms,
+            price: quote.price,
+        }));
     }
 
     async fn record_market_target_price(
@@ -463,6 +553,7 @@ impl ChainlinkOracleCache {
                 received_time_ms: Utc::now().timestamp_millis(),
                 price,
             },
+            true,
         )
         .await;
     }

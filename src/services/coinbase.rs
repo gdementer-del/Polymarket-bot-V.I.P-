@@ -29,8 +29,28 @@ pub struct CoinbaseClient {
     binance_client: BinanceClient,
     started_products: Arc<Mutex<HashSet<String>>>,
     l2_books: Arc<Mutex<HashMap<String, CoinbaseL2Book>>>,
+    latest_tickers: Arc<Mutex<HashMap<String, CoinbaseTickerPrice>>>,
     max_source_disagreement_bps: Decimal,
     max_spread_bps: Decimal,
+}
+
+/// Latest raw Coinbase ticker price accepted by Coinbase-side spread checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoinbaseTickerPriceView {
+    pub product_id: String,
+    pub symbol: String,
+    pub price: Decimal,
+    pub event_age_ms: i64,
+    pub received_age_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoinbaseTickerPrice {
+    product_id: String,
+    symbol: String,
+    price: Decimal,
+    event_time_ms: i64,
+    received_time_ms: i64,
 }
 
 impl CoinbaseClient {
@@ -47,9 +67,33 @@ impl CoinbaseClient {
             binance_client,
             started_products: Arc::new(Mutex::new(HashSet::new())),
             l2_books: Arc::new(Mutex::new(HashMap::new())),
+            latest_tickers: Arc::new(Mutex::new(HashMap::new())),
             max_source_disagreement_bps,
             max_spread_bps,
         }
+    }
+
+    /// Return latest raw Coinbase ticker prices observed by this sidecar.
+    #[must_use]
+    pub fn latest_ticker_price_views(&self) -> Vec<CoinbaseTickerPriceView> {
+        let now_ms = Utc::now().timestamp_millis();
+        let Ok(tickers) = self.latest_tickers.lock() else {
+            warn!("Coinbase latest_tickers mutex is poisoned; cannot read price monitor cache");
+            return Vec::new();
+        };
+
+        let mut views = tickers
+            .values()
+            .map(|ticker| CoinbaseTickerPriceView {
+                product_id: ticker.product_id.clone(),
+                symbol: ticker.symbol.clone(),
+                price: ticker.price,
+                event_age_ms: now_ms.saturating_sub(ticker.event_time_ms),
+                received_age_ms: now_ms.saturating_sub(ticker.received_time_ms),
+            })
+            .collect::<Vec<_>>();
+        views.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        views
     }
 
     /// Start a reconnecting Coinbase ticker stream for a supported market target.
@@ -170,6 +214,12 @@ impl CoinbaseClient {
                     return Ok(());
                 };
                 let event_time_ms = ticker.event_time_ms();
+                self.store_latest_ticker(
+                    expected_product_id,
+                    binance_symbol,
+                    event_time_ms,
+                    selected_price.price,
+                );
                 let _accepted = self
                     .binance_client
                     .ingest_coinbase_ticker_quote(
@@ -229,6 +279,29 @@ impl CoinbaseClient {
         }
 
         Ok(())
+    }
+
+    fn store_latest_ticker(
+        &self,
+        product_id: &str,
+        binance_symbol: &str,
+        event_time_ms: i64,
+        price: Decimal,
+    ) {
+        let Ok(mut tickers) = self.latest_tickers.lock() else {
+            warn!("Coinbase latest_tickers mutex is poisoned; skipping price monitor update");
+            return;
+        };
+        tickers.insert(
+            product_id.to_owned(),
+            CoinbaseTickerPrice {
+                product_id: product_id.to_owned(),
+                symbol: binance_symbol.to_owned(),
+                price,
+                event_time_ms,
+                received_time_ms: Utc::now().timestamp_millis(),
+            },
+        );
     }
 
     async fn publish_coinbase_l2_book(

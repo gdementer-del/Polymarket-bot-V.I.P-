@@ -289,6 +289,24 @@ pub struct LiveMarketDataHealth {
     pub depth_age_ms: Option<i64>,
 }
 
+/// Latest live price points split by source for one Binance symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSpotPriceView {
+    pub symbol: String,
+    pub binance_trade: Option<LiveSpotPricePoint>,
+    pub coinbase_ticker: Option<LiveSpotPricePoint>,
+    pub quote_points: usize,
+    pub depth_age_ms: Option<i64>,
+}
+
+/// One live spot-price point with clock-lag diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSpotPricePoint {
+    pub price: Decimal,
+    pub event_age_ms: i64,
+    pub received_age_ms: i64,
+}
+
 impl LiveMarketDataHealth {
     #[must_use]
     pub fn has_fresh_quote(&self, max_age_ms: i64) -> bool {
@@ -357,6 +375,14 @@ impl BinanceClient {
         self.trigger_tx.subscribe()
     }
 
+    /// Subscribe to reactive Polymarket Chainlink RTDS price events.
+    #[must_use]
+    pub fn subscribe_chainlink_triggers(
+        &self,
+    ) -> watch::Receiver<Option<super::chainlink::ChainlinkOracleTriggerEvent>> {
+        self.chainlink_oracle.subscribe_triggers()
+    }
+
     /// Start the Polymarket RTDS Chainlink oracle stream.
     #[must_use]
     pub fn start_chainlink_oracle_stream(
@@ -399,6 +425,54 @@ impl BinanceClient {
                 }
             })
             .collect()
+    }
+
+    /// Return latest accepted Binance and Coinbase price points for each symbol.
+    pub async fn live_spot_price_views(&self, symbols: &[&str]) -> Vec<LiveSpotPriceView> {
+        let now_ms = Utc::now().timestamp_millis();
+        let quote_cache = self.quote_cache.read().await;
+        let book_depth_cache = self.book_depth_cache.read().await;
+
+        symbols
+            .iter()
+            .map(|symbol| {
+                let normalized_symbol = normalize_symbol(symbol);
+                let quotes = quote_cache.get(&normalized_symbol);
+                let binance_trade = quotes.and_then(|quotes| {
+                    quotes
+                        .iter()
+                        .rev()
+                        .find(|quote| matches!(quote.source, SpotQuoteSource::BinanceTrade))
+                        .copied()
+                });
+                let coinbase_ticker = quotes.and_then(|quotes| {
+                    quotes
+                        .iter()
+                        .rev()
+                        .find(|quote| matches!(quote.source, SpotQuoteSource::CoinbaseTicker))
+                        .copied()
+                });
+                let depth_snapshot = book_depth_cache.get(&normalized_symbol);
+
+                LiveSpotPriceView {
+                    symbol: normalized_symbol,
+                    binance_trade: binance_trade.map(|quote| live_spot_price_point(quote, now_ms)),
+                    coinbase_ticker: coinbase_ticker
+                        .map(|quote| live_spot_price_point(quote, now_ms)),
+                    quote_points: quotes.map_or(0, VecDeque::len),
+                    depth_age_ms: depth_snapshot
+                        .map(|snapshot| now_ms.saturating_sub(snapshot.received_time_ms)),
+                }
+            })
+            .collect()
+    }
+
+    /// Return latest Polymarket Chainlink RTDS oracle quotes for configured targets.
+    pub async fn chainlink_price_views(
+        &self,
+        targets: &[MarketTarget],
+    ) -> Vec<super::chainlink::ChainlinkOraclePriceView> {
+        self.chainlink_oracle.latest_price_views(targets).await
     }
 
     /// Start reconnecting Binance market-data streams for a symbol.
@@ -2377,6 +2451,14 @@ fn latest_fresh_quote_from_source(
     quotes.iter().rev().copied().find(|quote| {
         quote.source == source && now_ms.saturating_sub(quote.received_time_ms) <= max_age_ms
     })
+}
+
+const fn live_spot_price_point(quote: LiveSpotQuote, now_ms: i64) -> LiveSpotPricePoint {
+    LiveSpotPricePoint {
+        price: quote.price,
+        event_age_ms: now_ms.saturating_sub(quote.event_time_ms),
+        received_age_ms: now_ms.saturating_sub(quote.received_time_ms),
+    }
 }
 
 #[cfg(test)]

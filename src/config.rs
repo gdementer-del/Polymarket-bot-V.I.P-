@@ -73,6 +73,16 @@ pub enum Command {
         cycles: Option<usize>,
     },
     /// Вывести аналитику по локальному журналу исполнений.
+    /// Show raw live price feeds from Binance, Coinbase, and Polymarket Chainlink RTDS.
+    #[command(name = "price-monitor", alias = "prices")]
+    PriceMonitor {
+        /// Refresh interval in seconds.
+        #[arg(long, default_value_t = DEFAULT_REFRESH_SECS)]
+        refresh_secs: u64,
+        /// Stop after this many refresh cycles. Handy for smoke tests.
+        #[arg(long)]
+        cycles: Option<usize>,
+    },
     Backtest {
         #[arg(long, default_value_t = 30)]
         windows_per_target: usize,
