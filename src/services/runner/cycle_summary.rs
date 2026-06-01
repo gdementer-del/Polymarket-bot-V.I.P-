@@ -137,6 +137,7 @@ pub(super) struct RuntimeLatencyMetrics {
     pub(super) selection_ms: u64,
     pub(super) revalidation_ms: u64,
     pub(super) execution_ms: u64,
+    pub(super) persistence_enqueue_ms: u64,
     pub(super) cycle_total_ms: u64,
 }
 
@@ -164,6 +165,7 @@ impl From<RuntimeLatencyMetrics> for PaperCycleLatencyMetrics {
             selection_ms: value.selection_ms,
             revalidation_ms: value.revalidation_ms,
             execution_ms: value.execution_ms,
+            persistence_enqueue_ms: value.persistence_enqueue_ms,
             cycle_total_ms: value.cycle_total_ms,
         }
     }
@@ -287,6 +289,7 @@ pub(super) fn build_paper_cycle_entry(
     regime_reason: Option<&str>,
     risk_block_reason: Option<&str>,
     risk_tracker: &RiskTracker,
+    trigger_source: Option<&str>,
 ) -> PaperCycleEntry {
     let current_market = runtime_summary.current_market.as_ref();
     let worst_open_position = summarize_worst_open_position(
@@ -346,7 +349,9 @@ pub(super) fn build_paper_cycle_entry(
     let top_near_miss = near_misses.first();
 
     PaperCycleEntry {
+        run_id: String::new(),
         recorded_at: Utc::now(),
+        trigger_source: trigger_source.map(str::to_owned),
         total_markets: runtime_summary.total_markets,
         live_markets: runtime_summary.live_markets,
         strategy_fit_count: runtime_summary.strategy_fit_count,

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use tokio::net::TcpStream;
 use tokio::sync::{RwLock, watch};
-use tokio::time::sleep;
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, info, warn};
@@ -40,14 +40,17 @@ const HTTP_RETRY_ATTEMPTS: u8 = 3;
 const HTTP_RETRY_DELAY_MS: u64 = 400;
 const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const POLYMARKET_MARKET_WS_RECONNECT_DELAY_MS: u64 = 300;
+const POLYMARKET_MARKET_WS_HEARTBEAT_SECS: u64 = 10;
 const LIVE_TRADE_RETENTION_MS: i64 = 60 * 60 * 1_000;
 const MARKET_BY_SLUG_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
-const LIVE_MARKET_SET_TTL_MS: i64 = 60_000;
+const LIVE_MARKET_SET_TTL_MS: i64 = 10_000;
 const EMPTY_LIVE_MARKET_SET_TTL_MS: i64 = 5_000;
 const SERVER_TIME_TTL_MS: i64 = 30_000;
 const MARKET_BY_SLUG_CACHE_MAX_ENTRIES: usize = 512;
 const LIVE_SUBSCRIPTION_PAST_GRACE_SECS: i64 = 60;
 const LIVE_SUBSCRIPTION_FUTURE_WINDOWS: i64 = 2;
+// Entry sweeps and executable paper exits both inspect at most three levels.
+const LIVE_DECISION_BOOK_LEVELS: usize = 3;
 
 /// Lightweight historical price point for one Polymarket token.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -599,41 +602,9 @@ impl MarketDataClient {
             return Ok(cached.markets);
         }
 
-        let now_ts = self.current_server_time_secs_fast().await;
-        let unique_targets = dedupe_targets(targets);
-        let mut seen = HashSet::with_capacity(unique_targets.len().saturating_mul(2));
-        let mut candidate_slugs = Vec::with_capacity(unique_targets.len().saturating_mul(2));
-        for target in unique_targets {
-            let current_start_ts = target.window_start_ts_at(now_ts);
-            let candidate_starts = [
-                current_start_ts,
-                current_start_ts.saturating_add(target.window_secs()),
-            ];
-
-            for start_ts in candidate_starts {
-                let slug = target.slug_for_window_start(start_ts);
-                if !seen.insert(slug.clone()) {
-                    continue;
-                }
-
-                candidate_slugs.push(slug);
-            }
-        }
-
-        let fetched_markets = stream::iter(candidate_slugs.into_iter().map(|slug| {
-            let client = self.clone();
-            async move { client.fetch_supported_market_by_slug(&slug).await }
-        }))
-        .buffer_unordered(MARKET_LOOKUP_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-        let mut markets = Vec::with_capacity(fetched_markets.len());
-        for result in fetched_markets {
-            if let Some(market) = result? {
-                markets.push(market);
-            }
-        }
-        markets.sort_by(|left, right| left.slug.cmp(&right.slug));
+        let markets = self
+            .fetch_live_markets_for_offsets(targets, &[0, 1])
+            .await?;
 
         let mut cache = self.live_market_set_cache.write().await;
         cache.insert(
@@ -649,6 +620,96 @@ impl MarketDataClient {
         });
 
         Ok(markets)
+    }
+
+    /// Fetch only the active window for an initial low-latency WS prewarm.
+    ///
+    /// The background refresher follows this with the normal current + next
+    /// discovery pass so future windows remain ready before rollover.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if every Gamma lookup in the batch fails.
+    pub async fn fetch_current_live_markets_for_prewarm(
+        &self,
+        targets: &[MarketTarget],
+    ) -> Result<Vec<BinaryMarket>> {
+        self.fetch_live_markets_for_offsets(targets, &[0]).await
+    }
+
+    async fn fetch_live_markets_for_offsets(
+        &self,
+        targets: &[MarketTarget],
+        window_offsets: &[i64],
+    ) -> Result<Vec<BinaryMarket>> {
+        let now_ts = self.current_server_time_secs_fast().await;
+        let candidate_slugs = live_market_slugs_for_offsets(targets, window_offsets, now_ts);
+        let fetched_markets = stream::iter(candidate_slugs.into_iter().map(|slug| {
+            let client = self.clone();
+            async move { client.fetch_supported_market_by_slug(&slug).await }
+        }))
+        .buffer_unordered(MARKET_LOOKUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut markets = Vec::with_capacity(fetched_markets.len());
+        let mut failures = 0_usize;
+        let mut first_error = None;
+        for result in fetched_markets {
+            match result {
+                Ok(Some(market)) => markets.push(market),
+                Ok(None) => {}
+                Err(error) => {
+                    failures += 1;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+
+        if markets.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
+        if failures > 0 {
+            warn!(
+                failures,
+                markets = markets.len(),
+                "live market discovery returned a partial Gamma response"
+            );
+        }
+        markets.sort_by(|left, right| left.slug.cmp(&right.slug));
+        Ok(markets)
+    }
+
+    /// Read the latest discovered live-market set without any HTTP fallback.
+    ///
+    /// The reactive runtime uses this method after prewarm so a signal can
+    /// never be delayed by Gamma discovery.
+    pub async fn cached_current_live_markets(&self, targets: &[MarketTarget]) -> Vec<BinaryMarket> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        let key = live_market_cache_key(targets);
+        let cache = self.live_market_set_cache.read().await;
+        if let Some(cached) = cache.get(&key) {
+            return cached.markets.clone();
+        }
+
+        let unique_targets = dedupe_targets(targets);
+        let mut seen = HashSet::new();
+        cache
+            .values()
+            .flat_map(|entry| entry.markets.iter())
+            .filter(|market| {
+                market
+                    .target()
+                    .is_some_and(|target| unique_targets.contains(&target))
+            })
+            .filter(|market| seen.insert(market.slug.clone()))
+            .cloned()
+            .collect()
     }
 
     /// Read the current Polymarket/Clob server time in unix seconds.
@@ -694,6 +755,16 @@ impl MarketDataClient {
     /// Returns an error if the Gamma API request fails.
     pub async fn fetch_supported_market_by_slug(&self, slug: &str) -> Result<Option<BinaryMarket>> {
         self.fetch_market_by_slug_with_options(slug, true).await
+    }
+
+    /// Read a previously discovered active market without any HTTP fallback.
+    pub async fn cached_supported_market_by_slug(&self, slug: &str) -> Option<BinaryMarket> {
+        let cache_key = market_slug_cache_key(slug, true);
+        self.market_by_slug_cache
+            .read()
+            .await
+            .get(&cache_key)
+            .map(|entry| entry.market.clone())
     }
 
     /// Fetch a single active BTC 5-minute market by slug.
@@ -1327,6 +1398,31 @@ fn live_market_cache_key(targets: &[MarketTarget]) -> String {
         .join("|")
 }
 
+fn live_market_slugs_for_offsets(
+    targets: &[MarketTarget],
+    window_offsets: &[i64],
+    now_ts: i64,
+) -> Vec<String> {
+    let unique_targets = dedupe_targets(targets);
+    let mut seen =
+        HashSet::with_capacity(unique_targets.len().saturating_mul(window_offsets.len()));
+    let mut slugs = Vec::with_capacity(seen.capacity());
+
+    for target in unique_targets {
+        let current_start_ts = target.window_start_ts_at(now_ts);
+        for offset in window_offsets {
+            let start_ts =
+                current_start_ts.saturating_add(target.window_secs().saturating_mul(*offset));
+            let slug = target.slug_for_window_start(start_ts);
+            if seen.insert(slug.clone()) {
+                slugs.push(slug);
+            }
+        }
+    }
+
+    slugs
+}
+
 fn live_subscription_slug_is_relevant(slug: &str, now_ts: i64) -> bool {
     let Some((target, start_ts)) = parse_supported_window_slug(slug) else {
         return false;
@@ -1339,6 +1435,14 @@ fn live_subscription_slug_is_relevant(slug: &str, now_ts: i64) -> bool {
 
     now_ts < end_ts.saturating_add(LIVE_SUBSCRIPTION_PAST_GRACE_SECS)
         && start_ts <= latest_future_start
+}
+
+fn live_subscription_slug_is_active(slug: &str, now_ts: i64) -> bool {
+    let Some((target, start_ts)) = parse_supported_window_slug(slug) else {
+        return false;
+    };
+
+    now_ts >= start_ts && now_ts < start_ts.saturating_add(target.window_secs())
 }
 
 fn parse_supported_window_slug(slug: &str) -> Option<(MarketTarget, i64)> {
@@ -1483,6 +1587,23 @@ fn normalize_timestamp_ms(timestamp_ms: Option<i64>) -> i64 {
     }
 }
 
+fn live_event_timestamp_ms(timestamp_ms: Option<i64>, received_time_ms: i64) -> i64 {
+    let event_time_ms = normalize_timestamp_ms(timestamp_ms);
+    if event_time_ms <= 0 {
+        received_time_ms
+    } else {
+        event_time_ms.min(received_time_ms)
+    }
+}
+
+fn insert_live_trade_event_ordered(queue: &mut VecDeque<LiveTradeEvent>, event: LiveTradeEvent) {
+    let insert_at = queue
+        .iter()
+        .position(|existing| existing.timestamp_ms > event.timestamp_ms)
+        .unwrap_or(queue.len());
+    queue.insert(insert_at, event);
+}
+
 fn market_slug_cache_key(slug: &str, require_active: bool) -> String {
     format!("{slug}:{require_active}")
 }
@@ -1499,7 +1620,7 @@ async fn run_polymarket_market_stream_loop(
     loop {
         let assets = {
             let state = state.read().await;
-            state.desired_assets.iter().cloned().collect::<Vec<_>>()
+            state.desired_assets.clone()
         };
 
         if assets.is_empty() {
@@ -1528,7 +1649,9 @@ async fn run_polymarket_market_stream_loop(
         );
 
         let (mut writer, mut reader) = socket.split();
-        if let Err(error) = subscribe_market_assets(&mut writer, &assets).await {
+        let mut subscribed_assets = assets;
+        let initial_assets = sorted_market_assets(&subscribed_assets);
+        if let Err(error) = subscribe_market_assets(&mut writer, &initial_assets).await {
             warn!(error = %error, "failed to subscribe to Polymarket market websocket");
             sleep(Duration::from_millis(
                 POLYMARKET_MARKET_WS_RECONNECT_DELAY_MS,
@@ -1536,6 +1659,10 @@ async fn run_polymarket_market_stream_loop(
             .await;
             continue;
         }
+
+        let mut heartbeat = interval(Duration::from_secs(POLYMARKET_MARKET_WS_HEARTBEAT_SECS));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
 
         loop {
             tokio::select! {
@@ -1546,15 +1673,48 @@ async fn run_polymarket_market_stream_loop(
 
                     let desired_assets = {
                         let state = state.read().await;
-                        state.desired_assets.iter().cloned().collect::<Vec<_>>()
+                        state.desired_assets.clone()
                     };
 
-                    if desired_assets != assets {
+                    let added_assets = subscribed_asset_diff(&desired_assets, &subscribed_assets);
+                    let removed_assets = subscribed_asset_diff(&subscribed_assets, &desired_assets);
+                    if !added_assets.is_empty() {
                         info!(
-                            old_assets = assets.len(),
-                            new_assets = desired_assets.len(),
-                            "Polymarket market websocket subscriptions changed; reconnecting stream"
+                            assets = added_assets.len(),
+                            "adding Polymarket market websocket subscriptions without reconnect"
                         );
+                        if let Err(error) = update_market_asset_subscriptions(
+                            &mut writer,
+                            &added_assets,
+                            "subscribe",
+                        )
+                        .await
+                        {
+                            warn!(error = %error, "failed to add Polymarket market websocket subscriptions");
+                            break;
+                        }
+                    }
+                    if !removed_assets.is_empty() {
+                        info!(
+                            assets = removed_assets.len(),
+                            "removing Polymarket market websocket subscriptions without reconnect"
+                        );
+                        if let Err(error) = update_market_asset_subscriptions(
+                            &mut writer,
+                            &removed_assets,
+                            "unsubscribe",
+                        )
+                        .await
+                        {
+                            warn!(error = %error, "failed to remove Polymarket market websocket subscriptions");
+                            break;
+                        }
+                    }
+                    subscribed_assets = desired_assets;
+                }
+                _ = heartbeat.tick() => {
+                    if writer.send(Message::Text("PING".into())).await.is_err() {
+                        warn!("failed to send Polymarket market websocket heartbeat");
                         break;
                     }
                 }
@@ -1614,6 +1774,43 @@ async fn subscribe_market_assets(writer: &mut MarketSocketWriter, assets: &[Stri
         })
 }
 
+async fn update_market_asset_subscriptions(
+    writer: &mut MarketSocketWriter,
+    assets: &[String],
+    operation: &str,
+) -> Result<()> {
+    let payload = market_asset_subscription_update_payload(assets, operation);
+    writer
+        .send(Message::Text(payload.into()))
+        .await
+        .map_err(|error| {
+            AppError::LiveExecution(format!(
+                "market websocket {operation} update failed: {error}"
+            ))
+        })
+}
+
+fn market_asset_subscription_update_payload(assets: &[String], operation: &str) -> String {
+    serde_json::json!({
+        "assets_ids": assets,
+        "operation": operation,
+        "custom_feature_enabled": true
+    })
+    .to_string()
+}
+
+fn sorted_market_assets(assets: &HashSet<String>) -> Vec<String> {
+    let mut assets = assets.iter().cloned().collect::<Vec<_>>();
+    assets.sort();
+    assets
+}
+
+fn subscribed_asset_diff(left: &HashSet<String>, right: &HashSet<String>) -> Vec<String> {
+    let mut difference = left.difference(right).cloned().collect::<Vec<_>>();
+    difference.sort();
+    difference
+}
+
 async fn process_market_ws_payload(
     state: &Arc<RwLock<PolymarketLiveState>>,
     market_update_tx: &watch::Sender<u64>,
@@ -1623,33 +1820,32 @@ async fn process_market_ws_payload(
         return;
     };
 
-    match value {
+    let updated = match value {
         MarketWsPayload::Batch(events) => {
+            let mut updated = false;
             for event in events {
-                process_market_ws_event(state, market_update_tx, event).await;
+                updated |= process_market_ws_event(state, event).await;
             }
+            updated
         }
-        MarketWsPayload::Single(event) => {
-            process_market_ws_event(state, market_update_tx, event).await;
-        }
+        MarketWsPayload::Single(event) => process_market_ws_event(state, event).await,
+    };
+
+    if updated {
+        market_update_tx.send_modify(|revision| *revision = revision.saturating_add(1));
     }
 }
 
 async fn process_market_ws_event(
     state: &Arc<RwLock<PolymarketLiveState>>,
-    market_update_tx: &watch::Sender<u64>,
     event: MarketWsEvent,
-) {
-    let updated = match event {
+) -> bool {
+    match event {
         MarketWsEvent::Book(event) => apply_book_event(state, event).await,
         MarketWsEvent::PriceChange(event) => apply_price_change_event(state, event).await,
         MarketWsEvent::LastTrade(event) => apply_last_trade_event(state, event).await,
         MarketWsEvent::TickSize(event) => apply_tick_size_event(state, event).await,
         MarketWsEvent::Other => false,
-    };
-
-    if updated {
-        market_update_tx.send_modify(|revision| *revision = revision.saturating_add(1));
     }
 }
 
@@ -1661,7 +1857,8 @@ async fn apply_book_event(
         return false;
     }
 
-    let timestamp_ms = normalize_timestamp_ms(event.timestamp_ms);
+    let received_time_ms = Utc::now().timestamp_millis();
+    let updated_at_ms = live_event_timestamp_ms(event.timestamp_ms, received_time_ms);
     let mut book = OrderBook {
         asset_id: event.asset_id.clone(),
         bids: event.bids,
@@ -1671,22 +1868,32 @@ async fn apply_book_event(
     };
     normalize_book_sides(&mut book);
     let mut state = state.write().await;
-    state.books.insert(
-        event.asset_id,
-        CachedOrderBook {
-            book,
-            updated_at_ms: timestamp_ms.max(Utc::now().timestamp_millis()),
-        },
-    );
-    true
+    let should_notify = market_asset_is_live(&state, &event.asset_id);
+    if let Some(cached) = state.books.get_mut(&event.asset_id) {
+        if cached.updated_at_ms > updated_at_ms {
+            return false;
+        }
+        let updated = order_book_decision_view_changed(&cached.book, &book);
+        cached.book = book;
+        cached.updated_at_ms = updated_at_ms;
+        updated && should_notify
+    } else {
+        state.books.insert(
+            event.asset_id,
+            CachedOrderBook {
+                book,
+                updated_at_ms,
+            },
+        );
+        should_notify
+    }
 }
 
 async fn apply_price_change_event(
     state: &Arc<RwLock<PolymarketLiveState>>,
     event: MarketWsPriceChangeEvent,
 ) -> bool {
-    let timestamp_ms =
-        normalize_timestamp_ms(event.timestamp_ms).max(Utc::now().timestamp_millis());
+    let timestamp_ms = live_event_timestamp_ms(event.timestamp_ms, Utc::now().timestamp_millis());
     let mut state = state.write().await;
     let mut updated = false;
 
@@ -1695,6 +1902,7 @@ async fn apply_price_change_event(
             continue;
         }
 
+        let should_notify = market_asset_is_live(&state, &change.asset_id);
         let cached = state
             .books
             .entry(change.asset_id.clone())
@@ -1708,18 +1916,24 @@ async fn apply_price_change_event(
                 },
                 updated_at_ms: timestamp_ms,
             });
-
-        let side = change.side.unwrap_or_default();
-        if wallet_side_is_buy_label(&side) {
-            apply_price_level_change(&mut cached.book.bids, change.price, change.size);
-        } else if wallet_side_is_sell_label(&side) {
-            apply_price_level_change(&mut cached.book.asks, change.price, change.size);
-        } else {
+        if cached.updated_at_ms > timestamp_ms {
             continue;
         }
-        normalize_book_sides(&mut cached.book);
+
+        let previous_view = order_book_decision_view(&cached.book);
+        let side = change.side.unwrap_or_default();
+        let level_updated = if wallet_side_is_buy_label(&side) {
+            apply_price_level_change(&mut cached.book.bids, change.price, change.size)
+        } else if wallet_side_is_sell_label(&side) {
+            apply_price_level_change(&mut cached.book.asks, change.price, change.size)
+        } else {
+            continue;
+        };
+        if level_updated {
+            normalize_book_sides(&mut cached.book);
+            updated |= should_notify && previous_view != order_book_decision_view(&cached.book);
+        }
         cached.updated_at_ms = timestamp_ms;
-        updated = true;
     }
 
     updated
@@ -1733,9 +1947,9 @@ async fn apply_tick_size_event(
         return false;
     }
 
-    let timestamp_ms =
-        normalize_timestamp_ms(event.timestamp_ms).max(Utc::now().timestamp_millis());
+    let timestamp_ms = live_event_timestamp_ms(event.timestamp_ms, Utc::now().timestamp_millis());
     let mut state = state.write().await;
+    let should_notify = market_asset_is_live(&state, &event.asset_id);
     let cached = state
         .books
         .entry(event.asset_id.clone())
@@ -1749,9 +1963,13 @@ async fn apply_tick_size_event(
             },
             updated_at_ms: timestamp_ms,
         });
+    if cached.updated_at_ms > timestamp_ms {
+        return false;
+    }
+    let updated = cached.book.tick_size != event.new_tick_size;
     cached.book.tick_size = event.new_tick_size;
     cached.updated_at_ms = timestamp_ms;
-    true
+    updated && should_notify
 }
 
 async fn apply_last_trade_event(
@@ -1767,8 +1985,7 @@ async fn apply_last_trade_event(
         return false;
     }
 
-    let timestamp_ms =
-        normalize_timestamp_ms(event.timestamp_ms).max(Utc::now().timestamp_millis());
+    let timestamp_ms = live_event_timestamp_ms(event.timestamp_ms, Utc::now().timestamp_millis());
     let mut state = state.write().await;
     let Some(meta) = state.asset_meta.get(&event.asset_id).cloned() else {
         return false;
@@ -1786,45 +2003,97 @@ async fn apply_last_trade_event(
         (true, true) | (false, false) => (notional, Decimal::ZERO),
         (true, false) | (false, true) => (Decimal::ZERO, notional),
     };
+    let should_notify = live_subscription_slug_is_active(&meta.slug, Utc::now().timestamp());
 
     let queue = state
         .trade_events_by_slug
         .entry(meta.slug)
         .or_insert_with(|| VecDeque::with_capacity(256));
-    queue.push_back(LiveTradeEvent {
-        timestamp_ms,
-        up_pressure_notional,
-        down_pressure_notional,
-    });
+    insert_live_trade_event_ordered(
+        queue,
+        LiveTradeEvent {
+            timestamp_ms,
+            up_pressure_notional,
+            down_pressure_notional,
+        },
+    );
 
-    let oldest_allowed = timestamp_ms.saturating_sub(LIVE_TRADE_RETENTION_MS);
+    let newest_timestamp_ms = queue
+        .back()
+        .map_or(timestamp_ms, |entry| entry.timestamp_ms)
+        .max(timestamp_ms);
+    let oldest_allowed = newest_timestamp_ms.saturating_sub(LIVE_TRADE_RETENTION_MS);
     while queue
         .front()
         .is_some_and(|entry| entry.timestamp_ms < oldest_allowed)
     {
         queue.pop_front();
     }
-    true
+    should_notify
 }
 
-fn apply_price_level_change(levels: &mut Vec<BookLevel>, price: Decimal, size: Decimal) {
+fn market_asset_is_live(state: &PolymarketLiveState, asset_id: &str) -> bool {
+    state
+        .asset_meta
+        .get(asset_id)
+        .is_some_and(|meta| live_subscription_slug_is_active(&meta.slug, Utc::now().timestamp()))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OrderBookDecisionView {
+    bids: Vec<BookLevel>,
+    asks: Vec<BookLevel>,
+    min_order_size: Option<Decimal>,
+    tick_size: Option<Decimal>,
+}
+
+fn order_book_decision_view(book: &OrderBook) -> OrderBookDecisionView {
+    OrderBookDecisionView {
+        bids: book
+            .bids
+            .iter()
+            .rev()
+            .take(LIVE_DECISION_BOOK_LEVELS)
+            .cloned()
+            .collect(),
+        asks: book
+            .asks
+            .iter()
+            .rev()
+            .take(LIVE_DECISION_BOOK_LEVELS)
+            .cloned()
+            .collect(),
+        min_order_size: book.min_order_size,
+        tick_size: book.tick_size,
+    }
+}
+
+fn order_book_decision_view_changed(previous: &OrderBook, next: &OrderBook) -> bool {
+    order_book_decision_view(previous) != order_book_decision_view(next)
+}
+
+fn apply_price_level_change(levels: &mut Vec<BookLevel>, price: Decimal, size: Decimal) -> bool {
     if size <= Decimal::ZERO {
+        let previous_len = levels.len();
         levels.retain(|level| level.price != price);
-        return;
+        return levels.len() != previous_len;
     }
 
     if let Some(level) = levels.iter_mut().find(|level| level.price == price) {
+        if level.size == size {
+            return false;
+        }
         level.size = size;
     } else {
         levels.push(BookLevel { price, size });
     }
+    true
 }
 
 fn normalize_book_sides(book: &mut OrderBook) {
-    book.bids
-        .sort_by(|left, right| left.price.cmp(&right.price));
+    book.bids.sort_by_key(|level| level.price);
     book.asks
-        .sort_by(|left, right| right.price.cmp(&left.price));
+        .sort_by_key(|level| std::cmp::Reverse(level.price));
 }
 
 fn option_i64_from_any<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
@@ -1875,7 +2144,7 @@ struct MarketWsBookEvent {
     bids: Vec<BookLevel>,
     #[serde(default)]
     asks: Vec<BookLevel>,
-    #[serde(default, deserialize_with = "option_i64_from_any")]
+    #[serde(default, alias = "timestamp", deserialize_with = "option_i64_from_any")]
     timestamp_ms: Option<i64>,
 }
 
@@ -1883,7 +2152,7 @@ struct MarketWsBookEvent {
 struct MarketWsPriceChangeEvent {
     #[serde(default)]
     price_changes: Vec<MarketWsPriceChange>,
-    #[serde(default, deserialize_with = "option_i64_from_any")]
+    #[serde(default, alias = "timestamp", deserialize_with = "option_i64_from_any")]
     timestamp_ms: Option<i64>,
 }
 
@@ -1911,7 +2180,7 @@ struct MarketWsLastTradeEvent {
     price: Decimal,
     #[serde(deserialize_with = "decimal_from_any")]
     size: Decimal,
-    #[serde(default, deserialize_with = "option_i64_from_any")]
+    #[serde(default, alias = "timestamp", deserialize_with = "option_i64_from_any")]
     timestamp_ms: Option<i64>,
 }
 
@@ -1921,7 +2190,7 @@ struct MarketWsTickSizeEvent {
     asset_id: String,
     #[serde(default, deserialize_with = "option_decimal_from_any")]
     new_tick_size: Option<Decimal>,
-    #[serde(default, deserialize_with = "option_i64_from_any")]
+    #[serde(default, alias = "timestamp", deserialize_with = "option_i64_from_any")]
     timestamp_ms: Option<i64>,
 }
 
@@ -1972,16 +2241,24 @@ fn live_market_set_ttl_ms(markets: &[BinaryMarket]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Arc;
+
+    use chrono::Utc;
     use rust_decimal::Decimal;
+    use tokio::sync::{RwLock, watch};
 
     use crate::models::{BinaryMarket, BookLevel, MarketTarget, OrderBook, TargetPriceSource};
 
     use super::{
-        CachedServerTime, EMPTY_LIVE_MARKET_SET_TTL_MS, LIVE_MARKET_SET_TTL_MS,
-        ProfileActivityRecord, TradeFlowSummary, TradeRecord, generate_target_market_slugs,
-        live_market_set_ttl_ms, live_subscription_slug_is_relevant, normalize_book_sides,
-        parse_supported_window_slug, prioritize_target_event_slugs_at,
-        project_cached_server_time_secs,
+        CachedServerTime, EMPTY_LIVE_MARKET_SET_TTL_MS, LIVE_MARKET_SET_TTL_MS, LiveAssetMeta,
+        LiveTradeEvent, PolymarketLiveState, ProfileActivityRecord, TradeFlowSummary, TradeRecord,
+        apply_price_level_change, generate_target_market_slugs, insert_live_trade_event_ordered,
+        live_event_timestamp_ms, live_market_set_ttl_ms, live_market_slugs_for_offsets,
+        live_subscription_slug_is_active, live_subscription_slug_is_relevant,
+        market_asset_subscription_update_payload, normalize_book_sides,
+        parse_supported_window_slug, prioritize_target_event_slugs_at, process_market_ws_payload,
+        project_cached_server_time_secs, subscribed_asset_diff,
     };
 
     #[test]
@@ -2070,6 +2347,50 @@ mod tests {
     }
 
     #[test]
+    fn live_event_time_uses_receive_time_only_as_missing_or_future_bound() {
+        assert_eq!(live_event_timestamp_ms(None, 10_000), 10_000);
+        assert_eq!(live_event_timestamp_ms(Some(9), 10_000), 9_000);
+        assert_eq!(live_event_timestamp_ms(Some(11), 10_000), 10_000);
+        assert_eq!(
+            live_event_timestamp_ms(Some(19_500_000_000), 20_000_000_000),
+            19_500_000_000
+        );
+        assert_eq!(
+            live_event_timestamp_ms(Some(20_500_000_000), 20_000_000_000),
+            20_000_000_000
+        );
+    }
+
+    #[test]
+    fn out_of_order_live_trade_event_is_inserted_by_event_time() {
+        let mut queue = VecDeque::new();
+        insert_live_trade_event_ordered(
+            &mut queue,
+            LiveTradeEvent {
+                timestamp_ms: 2_000,
+                up_pressure_notional: Decimal::ONE,
+                down_pressure_notional: Decimal::ZERO,
+            },
+        );
+        insert_live_trade_event_ordered(
+            &mut queue,
+            LiveTradeEvent {
+                timestamp_ms: 1_000,
+                up_pressure_notional: Decimal::ZERO,
+                down_pressure_notional: Decimal::ONE,
+            },
+        );
+
+        assert_eq!(
+            queue
+                .iter()
+                .map(|event| event.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000]
+        );
+    }
+
+    #[test]
     fn live_market_set_cache_keeps_hits_longer_than_misses() {
         let market = BinaryMarket {
             condition_id: "cond".to_owned(),
@@ -2091,6 +2412,32 @@ mod tests {
     }
 
     #[test]
+    fn live_market_slugs_for_offsets_prioritizes_current_before_future_windows() {
+        let now_ts = 1_779_471_123;
+        let current_btc = MarketTarget::Btc5m.window_start_ts_at(now_ts);
+        let current_eth = MarketTarget::Eth5m.window_start_ts_at(now_ts);
+
+        assert_eq!(
+            live_market_slugs_for_offsets(
+                &[MarketTarget::Btc5m, MarketTarget::Eth5m],
+                &[0],
+                now_ts,
+            ),
+            vec![
+                MarketTarget::Btc5m.slug_for_window_start(current_btc),
+                MarketTarget::Eth5m.slug_for_window_start(current_eth),
+            ]
+        );
+        assert_eq!(
+            live_market_slugs_for_offsets(&[MarketTarget::Btc5m], &[0, 1], now_ts),
+            vec![
+                MarketTarget::Btc5m.slug_for_window_start(current_btc),
+                MarketTarget::Btc5m.slug_for_window_start(current_btc + 300),
+            ]
+        );
+    }
+
+    #[test]
     fn live_subscription_slug_relevance_keeps_current_and_next_windows() {
         let now_ts = 1_779_471_123;
         let current_start = MarketTarget::Btc5m.window_start_ts_at(now_ts);
@@ -2103,6 +2450,22 @@ mod tests {
         assert!(live_subscription_slug_is_relevant(&next, now_ts));
         assert!(!live_subscription_slug_is_relevant(&old, now_ts));
         assert!(!live_subscription_slug_is_relevant(&far_future, now_ts));
+    }
+
+    #[test]
+    fn market_subscription_update_payload_adds_only_new_assets() {
+        let subscribed = HashSet::from(["current".to_owned()]);
+        let desired = HashSet::from(["current".to_owned(), "next".to_owned()]);
+        let added = subscribed_asset_diff(&desired, &subscribed);
+        let removed = subscribed_asset_diff(&subscribed, &desired);
+
+        assert_eq!(added, vec!["next".to_owned()]);
+        assert!(removed.is_empty());
+        let payload = market_asset_subscription_update_payload(&added, "subscribe");
+        let json = serde_json::from_str::<serde_json::Value>(&payload).expect("valid JSON");
+        assert_eq!(json["operation"], "subscribe");
+        assert_eq!(json["assets_ids"], serde_json::json!(["next"]));
+        assert_eq!(json["custom_feature_enabled"], true);
     }
 
     #[test]
@@ -2231,5 +2594,211 @@ mod tests {
             book.best_ask().map(|level| level.price),
             Some(Decimal::new(16, 2))
         );
+    }
+
+    #[test]
+    fn duplicate_price_level_change_does_not_report_book_update() {
+        let mut levels = vec![BookLevel {
+            price: Decimal::new(55, 2),
+            size: Decimal::from(10_u32),
+        }];
+
+        assert!(!apply_price_level_change(
+            &mut levels,
+            Decimal::new(55, 2),
+            Decimal::from(10_u32),
+        ));
+        assert!(apply_price_level_change(
+            &mut levels,
+            Decimal::new(55, 2),
+            Decimal::from(11_u32),
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_book_snapshot_does_not_emit_second_market_trigger() {
+        let state = Arc::new(RwLock::new(live_test_state_for_assets(&["token"])));
+        let (tx, mut rx) = watch::channel(0_u64);
+        let payload = r#"{
+            "event_type": "book",
+            "asset_id": "token",
+            "bids": [{"price": "0.45", "size": "10"}],
+            "asks": [{"price": "0.55", "size": "10"}],
+            "timestamp": "1779471123000"
+        }"#;
+
+        process_market_ws_payload(&state, &tx, payload).await;
+        assert_eq!(*rx.borrow_and_update(), 1);
+
+        process_market_ws_payload(&state, &tx, payload).await;
+        assert_eq!(*rx.borrow_and_update(), 1);
+    }
+
+    #[tokio::test]
+    async fn replayed_old_book_snapshot_does_not_replace_newer_cache() {
+        let state = Arc::new(RwLock::new(live_test_state_for_assets(&["token"])));
+        let (tx, _rx) = watch::channel(0_u64);
+        let now_ms = Utc::now().timestamp_millis();
+        let newer = format!(
+            r#"{{
+                "event_type": "book",
+                "asset_id": "token",
+                "bids": [{{"price": "0.45", "size": "10"}}],
+                "asks": [{{"price": "0.55", "size": "10"}}],
+                "timestamp": "{}"
+            }}"#,
+            now_ms.saturating_sub(100)
+        );
+        let replayed = format!(
+            r#"{{
+                "event_type": "book",
+                "asset_id": "token",
+                "bids": [{{"price": "0.30", "size": "10"}}],
+                "asks": [{{"price": "0.70", "size": "10"}}],
+                "timestamp": "{}"
+            }}"#,
+            now_ms.saturating_sub(1_000)
+        );
+
+        process_market_ws_payload(&state, &tx, &newer).await;
+        process_market_ws_payload(&state, &tx, &replayed).await;
+        let state = state.read().await;
+        let cached = state.books.get("token").expect("cached book");
+
+        assert_eq!(
+            cached.book.best_bid().map(|level| level.price),
+            Some(Decimal::new(45, 2))
+        );
+        assert_eq!(
+            cached.book.best_ask().map(|level| level.price),
+            Some(Decimal::new(55, 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn last_trade_timestamp_alias_preserves_exchange_event_time() {
+        let state = Arc::new(RwLock::new(live_test_state_for_assets(&["token"])));
+        let (tx, _rx) = watch::channel(0_u64);
+        let expected_timestamp_ms = Utc::now().timestamp_millis().saturating_sub(1_500);
+        let payload = format!(
+            r#"{{
+                "event_type": "last_trade_price",
+                "market": "condition",
+                "asset_id": "token",
+                "side": "BUY",
+                "price": "0.55",
+                "size": "10",
+                "timestamp": "{expected_timestamp_ms}"
+            }}"#
+        );
+
+        process_market_ws_payload(&state, &tx, &payload).await;
+        let state = state.read().await;
+        let events = state
+            .trade_events_by_slug
+            .values()
+            .next()
+            .expect("trade-flow event queue");
+
+        assert_eq!(
+            events.front().map(|event| event.timestamp_ms),
+            Some(expected_timestamp_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn market_ws_batch_emits_one_trigger_for_multiple_book_changes() {
+        let state = Arc::new(RwLock::new(live_test_state_for_assets(&[
+            "up-token",
+            "down-token",
+        ])));
+        let (tx, mut rx) = watch::channel(0_u64);
+        let payload = r#"[
+            {
+                "event_type": "book",
+                "asset_id": "up-token",
+                "bids": [{"price": "0.45", "size": "10"}],
+                "asks": [{"price": "0.55", "size": "10"}],
+                "timestamp": "1779471123000"
+            },
+            {
+                "event_type": "book",
+                "asset_id": "down-token",
+                "bids": [{"price": "0.40", "size": "12"}],
+                "asks": [{"price": "0.60", "size": "12"}],
+                "timestamp": "1779471123000"
+            }
+        ]"#;
+
+        process_market_ws_payload(&state, &tx, payload).await;
+
+        assert_eq!(*rx.borrow_and_update(), 1);
+    }
+
+    #[tokio::test]
+    async fn deep_book_change_updates_cache_without_emitting_market_trigger() {
+        let state = Arc::new(RwLock::new(live_test_state_for_assets(&["token"])));
+        let (tx, mut rx) = watch::channel(0_u64);
+        let initial_book = r#"{
+            "event_type": "book",
+            "asset_id": "token",
+            "bids": [
+                {"price": "0.10", "size": "10"},
+                {"price": "0.20", "size": "10"},
+                {"price": "0.30", "size": "10"},
+                {"price": "0.40", "size": "10"}
+            ],
+            "asks": [{"price": "0.60", "size": "10"}]
+        }"#;
+        let deep_change = r#"{
+            "event_type": "price_change",
+            "price_changes": [
+                {"asset_id": "token", "price": "0.10", "size": "11", "side": "BUY"}
+            ]
+        }"#;
+        let top_change = r#"{
+            "event_type": "price_change",
+            "price_changes": [
+                {"asset_id": "token", "price": "0.40", "size": "11", "side": "BUY"}
+            ]
+        }"#;
+
+        process_market_ws_payload(&state, &tx, initial_book).await;
+        assert_eq!(*rx.borrow_and_update(), 1);
+
+        process_market_ws_payload(&state, &tx, deep_change).await;
+        assert_eq!(*rx.borrow_and_update(), 1);
+
+        process_market_ws_payload(&state, &tx, top_change).await;
+        assert_eq!(*rx.borrow_and_update(), 2);
+    }
+
+    #[test]
+    fn live_subscription_active_filter_skips_prewarmed_next_window() {
+        let now_ts = Utc::now().timestamp();
+        let current_start = MarketTarget::Btc5m.window_start_ts_at(now_ts);
+        let current = MarketTarget::Btc5m.slug_for_window_start(current_start);
+        let next = MarketTarget::Btc5m.slug_for_window_start(current_start + 300);
+
+        assert!(live_subscription_slug_is_active(&current, now_ts));
+        assert!(!live_subscription_slug_is_active(&next, now_ts));
+    }
+
+    fn live_test_state_for_assets(asset_ids: &[&str]) -> PolymarketLiveState {
+        let now_ts = Utc::now().timestamp();
+        let current_start = MarketTarget::Btc5m.window_start_ts_at(now_ts);
+        let slug = MarketTarget::Btc5m.slug_for_window_start(current_start);
+        let mut state = PolymarketLiveState::default();
+        for asset_id in asset_ids {
+            state.asset_meta.insert(
+                (*asset_id).to_owned(),
+                LiveAssetMeta {
+                    slug: slug.clone(),
+                    condition_id: "condition".to_owned(),
+                    is_up_outcome: true,
+                },
+            );
+        }
+        state
     }
 }

@@ -2765,6 +2765,42 @@ impl BundleArbitrageStrategy {
         let kind = OpportunityKind::CodexScalpProbeV1;
         let label = kind.as_str();
 
+        if codex_scalp_probe_v1_raw_light_mode(&self.config)
+            && !codex_scalp_probe_v1_raw_light_target_allowed(context.target)
+        {
+            let primary = primary_quote(context, quotes);
+            return Some(scored_near_miss(
+                market,
+                context,
+                kind,
+                primary.label.to_owned(),
+                Some(primary.ask_price),
+                None,
+                0,
+                "oracle anchor".to_owned(),
+                format!("public Chainlink oracle anchor is unavailable for {label}"),
+                u8::MAX,
+            ));
+        }
+
+        if codex_scalp_probe_v1_raw_light_mode(&self.config)
+            && !context.target_price_source.is_explicit()
+        {
+            let primary = primary_quote(context, quotes);
+            return Some(scored_near_miss(
+                market,
+                context,
+                kind,
+                primary.label.to_owned(),
+                Some(primary.ask_price),
+                None,
+                0,
+                "oracle fallback".to_owned(),
+                format!("oracle target price is still using exchange fallback for {label}"),
+                u8::MAX,
+            ));
+        }
+
         if elapsed_window_secs(context) < self.config.codex_scalp_probe_v1_min_elapsed_window_secs {
             let shortfall_secs = self.config.codex_scalp_probe_v1_min_elapsed_window_secs
                 - elapsed_window_secs(context);
@@ -3114,10 +3150,12 @@ impl BundleArbitrageStrategy {
                     0,
                 ));
             }
-            let aligned_micro_or_swing = decision
-                .aligned_micro_bps
-                .max(decision.aligned_swing_bps)
-                .max(radar.fresh_confirmation_bps);
+            let continuation_coherence =
+                codex_scalp_probe_v1_raw_light_continuation_coherence_allows(
+                    profile,
+                    &decision,
+                    target_gap_abs,
+                );
             let normal_lane = primary.ask_price <= profile.max_entry_price
                 && decision.signal_strength_bps >= profile.min_signal_bps
                 && target_gap_abs >= profile.min_target_gap_bps
@@ -3125,23 +3163,20 @@ impl BundleArbitrageStrategy {
                 && decision.aligned_micro_bps >= profile.min_aligned_micro_bps
                 && decision.aligned_swing_bps >= profile.min_aligned_swing_bps
                 && aligned_top_bps >= profile.min_top_imbalance_bps
-                && aligned_depth_bps >= profile.min_depth_imbalance_bps;
-            let cheap_lottery_lane = primary.ask_price <= profile.cheap_entry_price
-                && decision.signal_strength_bps >= profile.cheap_min_signal_bps
-                && target_gap_abs >= profile.cheap_min_target_gap_bps
-                && aligned_micro_or_swing >= profile.cheap_min_aligned_bps
-                && aligned_top_bps >= Decimal::ZERO
-                && aligned_depth_bps >= Decimal::ZERO;
+                && aligned_depth_bps >= profile.min_depth_imbalance_bps
+                && continuation_coherence;
             let hot_momentum_lane = primary.ask_price > profile.max_entry_price
                 && primary.ask_price <= profile.hot_max_entry_price
                 && decision.signal_strength_bps >= profile.hot_min_signal_bps
                 && target_gap_abs >= profile.hot_min_target_gap_bps
                 && radar.fresh_confirmation_bps >= profile.hot_min_fresh_bps
-                && aligned_micro_or_swing >= profile.hot_min_aligned_bps
+                && decision.aligned_micro_bps >= profile.hot_min_aligned_bps
+                && decision.aligned_swing_bps >= profile.hot_min_aligned_bps
                 && aligned_top_bps >= profile.hot_min_top_imbalance_bps
-                && aligned_depth_bps >= profile.hot_min_depth_imbalance_bps;
+                && aligned_depth_bps >= profile.hot_min_depth_imbalance_bps
+                && continuation_coherence;
 
-            if normal_lane || cheap_lottery_lane || hot_momentum_lane {
+            if normal_lane || hot_momentum_lane {
                 return Some(scored_near_miss(
                     market,
                     context,
@@ -3173,9 +3208,113 @@ impl BundleArbitrageStrategy {
                 ));
             }
 
-            if primary.ask_price > profile.cheap_entry_price
-                && (aligned_top_bps < profile.min_top_imbalance_bps
-                    || aligned_depth_bps < profile.min_depth_imbalance_bps)
+            if primary.ask_price > profile.max_entry_price {
+                if radar.fresh_confirmation_bps < profile.hot_min_fresh_bps {
+                    return Some(scored_near_miss(
+                        market,
+                        context,
+                        kind,
+                        primary.label.to_owned(),
+                        Some(primary.ask_price),
+                        None,
+                        whole_bps_shortfall(
+                            radar.fresh_confirmation_bps,
+                            profile.hot_min_fresh_bps,
+                        ),
+                        format!(
+                            "fresh {} < {}",
+                            radar.fresh_confirmation_bps.round_dp(2),
+                            profile.hot_min_fresh_bps.round_dp(2)
+                        ),
+                        format!("premium scalp lacks fresh 1s confirmation for {label}"),
+                        0,
+                    ));
+                }
+                if decision.aligned_micro_bps < profile.hot_min_aligned_bps {
+                    return Some(scored_near_miss(
+                        market,
+                        context,
+                        kind,
+                        primary.label.to_owned(),
+                        Some(primary.ask_price),
+                        None,
+                        whole_bps_shortfall(
+                            decision.aligned_micro_bps,
+                            profile.hot_min_aligned_bps,
+                        ),
+                        format!(
+                            "5s {} < {}",
+                            decision.aligned_micro_bps.round_dp(2),
+                            profile.hot_min_aligned_bps.round_dp(2)
+                        ),
+                        format!("premium scalp lacks aligned 5s confirmation for {label}"),
+                        0,
+                    ));
+                }
+                if decision.aligned_swing_bps < profile.hot_min_aligned_bps {
+                    return Some(scored_near_miss(
+                        market,
+                        context,
+                        kind,
+                        primary.label.to_owned(),
+                        Some(primary.ask_price),
+                        None,
+                        whole_bps_shortfall(
+                            decision.aligned_swing_bps,
+                            profile.hot_min_aligned_bps,
+                        ),
+                        format!(
+                            "15s {} < {}",
+                            decision.aligned_swing_bps.round_dp(2),
+                            profile.hot_min_aligned_bps.round_dp(2)
+                        ),
+                        format!("premium scalp lacks aligned 15s confirmation for {label}"),
+                        0,
+                    ));
+                }
+                if decision.signal_strength_bps < profile.hot_min_signal_bps {
+                    return Some(scored_near_miss(
+                        market,
+                        context,
+                        kind,
+                        primary.label.to_owned(),
+                        Some(primary.ask_price),
+                        None,
+                        whole_bps_shortfall(
+                            decision.signal_strength_bps,
+                            profile.hot_min_signal_bps,
+                        ),
+                        format!(
+                            "signal {} < {}",
+                            decision.signal_strength_bps.round_dp(2),
+                            profile.hot_min_signal_bps.round_dp(2)
+                        ),
+                        format!("premium scalp signal is still below threshold for {label}"),
+                        0,
+                    ));
+                }
+                if target_gap_abs < profile.hot_min_target_gap_bps {
+                    return Some(scored_near_miss(
+                        market,
+                        context,
+                        kind,
+                        primary.label.to_owned(),
+                        Some(primary.ask_price),
+                        None,
+                        whole_bps_shortfall(target_gap_abs, profile.hot_min_target_gap_bps),
+                        format!(
+                            "gap {} < {}",
+                            target_gap_abs.round_dp(2),
+                            profile.hot_min_target_gap_bps.round_dp(2)
+                        ),
+                        format!("premium scalp target gap is still below threshold for {label}"),
+                        0,
+                    ));
+                }
+            }
+
+            if aligned_top_bps < profile.min_top_imbalance_bps
+                || aligned_depth_bps < profile.min_depth_imbalance_bps
             {
                 return Some(scored_near_miss(
                     market,
@@ -3195,6 +3334,49 @@ impl BundleArbitrageStrategy {
                 ));
             }
 
+            if decision.aligned_flow_bps < profile.min_aligned_flow_bps {
+                return Some(scored_near_miss(
+                    market,
+                    context,
+                    kind,
+                    primary.label.to_owned(),
+                    Some(primary.ask_price),
+                    None,
+                    whole_bps_shortfall(decision.aligned_flow_bps, profile.min_aligned_flow_bps),
+                    format!(
+                        "flow {} < {}",
+                        decision.aligned_flow_bps.round_dp(1),
+                        profile.min_aligned_flow_bps.round_dp(1)
+                    ),
+                    format!("continuation trade flow is too weak for {label}"),
+                    0,
+                ));
+            }
+            if target_gap_abs >= profile.high_gap_threshold_bps
+                && (decision.signal_strength_bps < profile.high_gap_min_signal_bps
+                    || decision.aligned_flow_bps < profile.high_gap_min_aligned_flow_bps)
+            {
+                return Some(scored_near_miss(
+                    market,
+                    context,
+                    kind,
+                    primary.label.to_owned(),
+                    Some(primary.ask_price),
+                    None,
+                    decimal_to_whole_units(decision.signal_strength_bps),
+                    format!(
+                        "gap {}, signal {} < {}, flow {} < {}",
+                        target_gap_abs.round_dp(2),
+                        decision.signal_strength_bps.round_dp(1),
+                        profile.high_gap_min_signal_bps.round_dp(1),
+                        decision.aligned_flow_bps.round_dp(1),
+                        profile.high_gap_min_aligned_flow_bps.round_dp(1)
+                    ),
+                    format!("extended continuation lacks signal coherence for {label}"),
+                    0,
+                ));
+            }
+
             return Some(scored_near_miss(
                 market,
                 context,
@@ -3204,12 +3386,13 @@ impl BundleArbitrageStrategy {
                 None,
                 decimal_to_whole_units(decision.signal_strength_bps),
                 format!(
-                    "gap {}, fresh {}, micro {}, swing {}, signal {}, top {}, depth {}",
+                    "gap {}, fresh {}, micro {}, swing {}, signal {}, flow {}, top {}, depth {}",
                     target_gap_abs.round_dp(2),
                     radar.fresh_confirmation_bps.round_dp(2),
                     decision.aligned_micro_bps.round_dp(2),
                     decision.aligned_swing_bps.round_dp(2),
                     decision.signal_strength_bps.round_dp(1),
+                    decision.aligned_flow_bps.round_dp(1),
                     aligned_top_bps.round_dp(1),
                     aligned_depth_bps.round_dp(1)
                 ),
@@ -5666,6 +5849,15 @@ fn codex_scalp_probe_v1_target_allowed(target: MarketTarget) -> bool {
     )
 }
 
+fn codex_scalp_probe_v1_raw_light_target_allowed(target: MarketTarget) -> bool {
+    codex_scalp_probe_v1_target_allowed(target) && target.polymarket_chainlink_symbol().is_some()
+}
+
+fn codex_scalp_probe_v1_raw_light_anchor_available(context: &BtcFiveMinuteContext) -> bool {
+    codex_scalp_probe_v1_raw_light_target_allowed(context.target)
+        && context.target_price_source.is_explicit()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CodexScalpProbeRadar {
     score_bps: Decimal,
@@ -5794,17 +5986,17 @@ struct CodexScalpProbeRawLightProfile {
     max_entry_price: Decimal,
     hot_max_entry_price: Decimal,
     max_target_gap_bps: Decimal,
-    cheap_entry_price: Decimal,
     min_signal_bps: Decimal,
     min_target_gap_bps: Decimal,
     min_fresh_bps: Decimal,
+    min_aligned_flow_bps: Decimal,
     min_aligned_micro_bps: Decimal,
     min_aligned_swing_bps: Decimal,
     min_top_imbalance_bps: Decimal,
     min_depth_imbalance_bps: Decimal,
-    cheap_min_signal_bps: Decimal,
-    cheap_min_target_gap_bps: Decimal,
-    cheap_min_aligned_bps: Decimal,
+    high_gap_threshold_bps: Decimal,
+    high_gap_min_signal_bps: Decimal,
+    high_gap_min_aligned_flow_bps: Decimal,
     hot_min_signal_bps: Decimal,
     hot_min_target_gap_bps: Decimal,
     hot_min_fresh_bps: Decimal,
@@ -5821,17 +6013,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             max_entry_price: Decimal::new(68, 2),
             hot_max_entry_price: Decimal::new(82, 2),
             max_target_gap_bps: Decimal::new(1200, 2),
-            cheap_entry_price: Decimal::new(12, 2),
             min_signal_bps: Decimal::from(12_u32),
             min_target_gap_bps: Decimal::new(400, 2),
-            min_fresh_bps: Decimal::new(30, 2),
+            min_fresh_bps: Decimal::ONE,
+            min_aligned_flow_bps: Decimal::from(500_u32),
             min_aligned_micro_bps: Decimal::new(350, 2),
             min_aligned_swing_bps: Decimal::new(350, 2),
             min_top_imbalance_bps: Decimal::from(500_u32),
             min_depth_imbalance_bps: Decimal::from(500_u32),
-            cheap_min_signal_bps: Decimal::from(15_u32),
-            cheap_min_target_gap_bps: Decimal::new(300, 2),
-            cheap_min_aligned_bps: Decimal::new(400, 2),
+            high_gap_threshold_bps: Decimal::from(6_u32),
+            high_gap_min_signal_bps: Decimal::from(3_000_u32),
+            high_gap_min_aligned_flow_bps: Decimal::from(5_000_u32),
             hot_min_signal_bps: Decimal::from(20_u32),
             hot_min_target_gap_bps: Decimal::new(300, 2),
             hot_min_fresh_bps: Decimal::new(700, 2),
@@ -5844,17 +6036,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             max_entry_price: Decimal::new(62, 2),
             hot_max_entry_price: Decimal::new(76, 2),
             max_target_gap_bps: Decimal::new(1400, 2),
-            cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(22_u32),
             min_target_gap_bps: Decimal::new(800, 2),
             min_fresh_bps: Decimal::ONE,
+            min_aligned_flow_bps: Decimal::from(1_500_u32),
             min_aligned_micro_bps: Decimal::new(600, 2),
             min_aligned_swing_bps: Decimal::new(600, 2),
             min_top_imbalance_bps: Decimal::from(1_500_u32),
             min_depth_imbalance_bps: Decimal::from(1_500_u32),
-            cheap_min_signal_bps: Decimal::from(24_u32),
-            cheap_min_target_gap_bps: Decimal::new(600, 2),
-            cheap_min_aligned_bps: Decimal::new(700, 2),
+            high_gap_threshold_bps: Decimal::from(8_u32),
+            high_gap_min_signal_bps: Decimal::from(3_000_u32),
+            high_gap_min_aligned_flow_bps: Decimal::from(5_000_u32),
             hot_min_signal_bps: Decimal::from(30_u32),
             hot_min_target_gap_bps: Decimal::new(800, 2),
             hot_min_fresh_bps: Decimal::new(800, 2),
@@ -5867,17 +6059,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             max_entry_price: Decimal::new(62, 2),
             hot_max_entry_price: Decimal::new(76, 2),
             max_target_gap_bps: Decimal::new(1400, 2),
-            cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(20_u32),
             min_target_gap_bps: Decimal::new(800, 2),
             min_fresh_bps: Decimal::ONE,
+            min_aligned_flow_bps: Decimal::from(1_500_u32),
             min_aligned_micro_bps: Decimal::new(600, 2),
             min_aligned_swing_bps: Decimal::new(600, 2),
             min_top_imbalance_bps: Decimal::from(1_500_u32),
             min_depth_imbalance_bps: Decimal::from(1_500_u32),
-            cheap_min_signal_bps: Decimal::from(22_u32),
-            cheap_min_target_gap_bps: Decimal::new(600, 2),
-            cheap_min_aligned_bps: Decimal::new(700, 2),
+            high_gap_threshold_bps: Decimal::from(8_u32),
+            high_gap_min_signal_bps: Decimal::from(3_000_u32),
+            high_gap_min_aligned_flow_bps: Decimal::from(5_000_u32),
             hot_min_signal_bps: Decimal::from(28_u32),
             hot_min_target_gap_bps: Decimal::new(800, 2),
             hot_min_fresh_bps: Decimal::new(800, 2),
@@ -5890,17 +6082,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             max_entry_price: Decimal::new(58, 2),
             hot_max_entry_price: Decimal::new(74, 2),
             max_target_gap_bps: Decimal::new(1200, 2),
-            cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(22_u32),
             min_target_gap_bps: Decimal::new(700, 2),
             min_fresh_bps: Decimal::new(80, 2),
+            min_aligned_flow_bps: Decimal::from(1_500_u32),
             min_aligned_micro_bps: Decimal::new(650, 2),
             min_aligned_swing_bps: Decimal::new(700, 2),
             min_top_imbalance_bps: Decimal::from(1_500_u32),
             min_depth_imbalance_bps: Decimal::from(1_500_u32),
-            cheap_min_signal_bps: Decimal::from(22_u32),
-            cheap_min_target_gap_bps: Decimal::new(500, 2),
-            cheap_min_aligned_bps: Decimal::new(700, 2),
+            high_gap_threshold_bps: Decimal::from(7_u32),
+            high_gap_min_signal_bps: Decimal::from(3_000_u32),
+            high_gap_min_aligned_flow_bps: Decimal::from(5_000_u32),
             hot_min_signal_bps: Decimal::from(30_u32),
             hot_min_target_gap_bps: Decimal::new(800, 2),
             hot_min_fresh_bps: Decimal::new(800, 2),
@@ -5913,17 +6105,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             max_entry_price: Decimal::new(62, 2),
             hot_max_entry_price: Decimal::new(78, 2),
             max_target_gap_bps: Decimal::new(1000, 2),
-            cheap_entry_price: Decimal::new(10, 2),
             min_signal_bps: Decimal::from(8_u32),
             min_target_gap_bps: Decimal::new(400, 2),
             min_fresh_bps: Decimal::new(40, 2),
+            min_aligned_flow_bps: Decimal::from(1_500_u32),
             min_aligned_micro_bps: Decimal::new(150, 2),
             min_aligned_swing_bps: Decimal::new(300, 2),
             min_top_imbalance_bps: Decimal::from(1_500_u32),
             min_depth_imbalance_bps: Decimal::from(1_300_u32),
-            cheap_min_signal_bps: Decimal::from(10_u32),
-            cheap_min_target_gap_bps: Decimal::new(350, 2),
-            cheap_min_aligned_bps: Decimal::new(250, 2),
+            high_gap_threshold_bps: Decimal::from(6_u32),
+            high_gap_min_signal_bps: Decimal::from(3_000_u32),
+            high_gap_min_aligned_flow_bps: Decimal::from(5_000_u32),
             hot_min_signal_bps: Decimal::from(14_u32),
             hot_min_target_gap_bps: Decimal::new(400, 2),
             hot_min_fresh_bps: Decimal::new(400, 2),
@@ -5936,17 +6128,17 @@ fn codex_scalp_probe_v1_raw_light_profile(target: MarketTarget) -> CodexScalpPro
             max_entry_price: Decimal::ZERO,
             hot_max_entry_price: Decimal::ZERO,
             max_target_gap_bps: Decimal::ZERO,
-            cheap_entry_price: Decimal::ZERO,
             min_signal_bps: Decimal::MAX,
             min_target_gap_bps: Decimal::MAX,
             min_fresh_bps: Decimal::MAX,
+            min_aligned_flow_bps: Decimal::MAX,
             min_aligned_micro_bps: Decimal::MAX,
             min_aligned_swing_bps: Decimal::MAX,
             min_top_imbalance_bps: Decimal::MAX,
             min_depth_imbalance_bps: Decimal::MAX,
-            cheap_min_signal_bps: Decimal::MAX,
-            cheap_min_target_gap_bps: Decimal::MAX,
-            cheap_min_aligned_bps: Decimal::MAX,
+            high_gap_threshold_bps: Decimal::ZERO,
+            high_gap_min_signal_bps: Decimal::MAX,
+            high_gap_min_aligned_flow_bps: Decimal::MAX,
             hot_min_signal_bps: Decimal::MAX,
             hot_min_target_gap_bps: Decimal::MAX,
             hot_min_fresh_bps: Decimal::MAX,
@@ -5964,7 +6156,7 @@ fn codex_scalp_probe_v1_raw_light_allows(
     primary_book: &OrderBook,
     config: &StrategyConfig,
 ) -> bool {
-    if !codex_scalp_probe_v1_target_allowed(context.target)
+    if !codex_scalp_probe_v1_raw_light_anchor_available(context)
         || !is_valid_binary_price(primary_ask_price)
     {
         return false;
@@ -6018,10 +6210,11 @@ fn codex_scalp_probe_v1_raw_light_allows(
     if target_gap_abs > profile.max_target_gap_bps {
         return false;
     }
-    let aligned_micro_or_swing = decision
-        .aligned_micro_bps
-        .max(decision.aligned_swing_bps)
-        .max(fresh_confirmation_bps);
+    let continuation_coherence = codex_scalp_probe_v1_raw_light_continuation_coherence_allows(
+        profile,
+        decision,
+        target_gap_abs,
+    );
 
     let normal_lane = primary_ask_price <= profile.max_entry_price
         && decision.signal_strength_bps >= profile.min_signal_bps
@@ -6030,25 +6223,32 @@ fn codex_scalp_probe_v1_raw_light_allows(
         && decision.aligned_micro_bps >= profile.min_aligned_micro_bps
         && decision.aligned_swing_bps >= profile.min_aligned_swing_bps
         && aligned_top_bps >= profile.min_top_imbalance_bps
-        && aligned_depth_bps >= profile.min_depth_imbalance_bps;
-
-    let cheap_lottery_lane = primary_ask_price <= profile.cheap_entry_price
-        && decision.signal_strength_bps >= profile.cheap_min_signal_bps
-        && target_gap_abs >= profile.cheap_min_target_gap_bps
-        && aligned_micro_or_swing >= profile.cheap_min_aligned_bps
-        && aligned_top_bps >= Decimal::ZERO
-        && aligned_depth_bps >= Decimal::ZERO;
+        && aligned_depth_bps >= profile.min_depth_imbalance_bps
+        && continuation_coherence;
 
     let hot_momentum_lane = primary_ask_price > profile.max_entry_price
         && primary_ask_price <= profile.hot_max_entry_price
         && decision.signal_strength_bps >= profile.hot_min_signal_bps
         && target_gap_abs >= profile.hot_min_target_gap_bps
         && fresh_confirmation_bps >= profile.hot_min_fresh_bps
-        && aligned_micro_or_swing >= profile.hot_min_aligned_bps
+        && decision.aligned_micro_bps >= profile.hot_min_aligned_bps
+        && decision.aligned_swing_bps >= profile.hot_min_aligned_bps
         && aligned_top_bps >= profile.hot_min_top_imbalance_bps
-        && aligned_depth_bps >= profile.hot_min_depth_imbalance_bps;
+        && aligned_depth_bps >= profile.hot_min_depth_imbalance_bps
+        && continuation_coherence;
 
-    normal_lane || cheap_lottery_lane || hot_momentum_lane
+    normal_lane || hot_momentum_lane
+}
+
+fn codex_scalp_probe_v1_raw_light_continuation_coherence_allows(
+    profile: CodexScalpProbeRawLightProfile,
+    decision: &BonereaperStateV2Decision,
+    target_gap_abs: Decimal,
+) -> bool {
+    decision.aligned_flow_bps >= profile.min_aligned_flow_bps
+        && (target_gap_abs < profile.high_gap_threshold_bps
+            || (decision.signal_strength_bps >= profile.high_gap_min_signal_bps
+                && decision.aligned_flow_bps >= profile.high_gap_min_aligned_flow_bps))
 }
 
 fn codex_scalp_probe_v1_raw_light_mode(config: &StrategyConfig) -> bool {
@@ -6072,12 +6272,7 @@ fn codex_scalp_probe_v1_live_burst_bps(
     context: &BtcFiveMinuteContext,
     decision: &BonereaperStateV2Decision,
 ) -> Decimal {
-    aligned_move_bps(context.spot_move_1s_bps, decision.up_side)
-        .max(aligned_move_bps(
-            context.micro_acceleration_bps,
-            decision.up_side,
-        ))
-        .max(Decimal::ZERO)
+    aligned_move_bps(context.spot_move_1s_bps, decision.up_side).max(Decimal::ZERO)
 }
 
 fn codex_scalp_probe_v1_bnb_pressure_allows(
@@ -6365,7 +6560,7 @@ fn codex_sentinel_v1_has_fresh_live_spot(
     }
 
     match context.current_spot_source.as_str() {
-        "Coinbase::Ticker" | "Binance::Trade" => {}
+        "Coinbase::Level2" | "Coinbase::Ticker" | "Binance::Trade" => {}
         _ => return false,
     }
 
@@ -7294,7 +7489,7 @@ mod tests {
             target: MarketTarget::Btc5m,
             interval_open_price: decimal("100"),
             target_price: decimal("100"),
-            target_price_source: TargetPriceSource::BinanceWindowOpenFallback,
+            target_price_source: TargetPriceSource::PolymarketEventMetadata,
             target_gap_bps: decimal(target_gap_bps),
             current_spot_price: decimal("100"),
             current_spot_source: "test-fixture".to_owned(),
@@ -8294,13 +8489,14 @@ mod tests {
         config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
         config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
 
-        let mut context = test_codex_context("8.00", "0.00");
+        let mut context = test_codex_context("5.00", "0.00");
         context.current_spot_source = "Binance::Trade".to_owned();
         context.current_spot_received_age_ms = Some(25);
         context.exchange_book_age_ms = Some(30);
         context.exchange_book_top_imbalance_bps = Decimal::from(1_200);
         context.exchange_book_depth_imbalance_bps = Decimal::from(1_200);
         context.exchange_book_spread_bps = decimal("0.40");
+        context.micro_acceleration_bps = decimal("12.00");
         context.seconds_left = 275;
         let mut decision = test_codex_decision("14.00", "14.00");
         decision.signal_strength_bps = Decimal::from(450);
@@ -8326,7 +8522,7 @@ mod tests {
             &config,
         ));
 
-        context.spot_move_1s_bps = decimal("0.35");
+        context.spot_move_1s_bps = decimal("1.05");
         assert!(codex_scalp_probe_v1_allows(
             &context,
             &decision,
@@ -8337,7 +8533,112 @@ mod tests {
     }
 
     #[test]
-    fn codex_scalp_probe_v1_raw_light_allows_hot_momentum_chase() {
+    fn codex_scalp_probe_v1_raw_light_requires_continuation_trade_flow() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("5.00", "5.00");
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(25);
+        context.exchange_book_age_ms = Some(30);
+        context.exchange_book_top_imbalance_bps = Decimal::from(1_200);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(1_200);
+        context.exchange_book_spread_bps = decimal("0.40");
+        let mut decision = test_codex_decision("5.00", "5.00");
+        decision.signal_strength_bps = Decimal::from(1_000);
+        decision.aligned_flow_bps = Decimal::from(499);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.58"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.60"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(!codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.60"),
+            &book,
+            &config,
+        ));
+
+        decision.aligned_flow_bps = Decimal::from(500);
+        assert!(codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.60"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_requires_high_gap_signal_coherence() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("6.00", "5.00");
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(25);
+        context.exchange_book_age_ms = Some(30);
+        context.exchange_book_top_imbalance_bps = Decimal::from(1_200);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(1_200);
+        context.exchange_book_spread_bps = decimal("0.40");
+        let mut decision = test_codex_decision("5.00", "5.00");
+        decision.signal_strength_bps = Decimal::from(2_999);
+        decision.aligned_flow_bps = Decimal::from(4_999);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.58"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.60"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(!codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.60"),
+            &book,
+            &config,
+        ));
+
+        decision.signal_strength_bps = Decimal::from(3_000);
+        decision.aligned_flow_bps = Decimal::from(5_000);
+        assert!(codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.60"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_allows_hot_momentum_chase_with_explicit_oracle_anchor() {
         let mut config = strategy_config();
         config.codex_scalp_probe_v1_raw_ablation_enabled = true;
         config.codex_scalp_probe_v1_raw_light_enabled = true;
@@ -8348,6 +8649,59 @@ mod tests {
 
         let mut context = test_codex_context("9.00", "9.00");
         context.target = MarketTarget::Btc5m;
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(25);
+        context.exchange_book_age_ms = Some(20);
+        context.exchange_book_top_imbalance_bps = Decimal::from(5_800);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(4_200);
+        context.exchange_book_spread_bps = decimal("0.40");
+        context.spot_move_1s_bps = decimal("7.50");
+        let mut decision = test_codex_decision("9.00", "9.00");
+        decision.signal_strength_bps = Decimal::from(3_500);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.73"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.76"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.76"),
+            &book,
+            &config,
+        ));
+
+        context.target_price_source = TargetPriceSource::BinanceWindowOpenFallback;
+        assert!(!codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.76"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_blocks_bnb_without_public_chainlink_anchor() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("9.00", "9.00");
+        context.target = MarketTarget::Bnb5m;
         context.current_spot_source = "Binance::Trade".to_owned();
         context.current_spot_received_age_ms = Some(25);
         context.exchange_book_age_ms = Some(20);
@@ -8371,7 +8725,7 @@ mod tests {
             tick_size: None,
         };
 
-        assert!(codex_scalp_probe_v1_allows(
+        assert!(!codex_scalp_probe_v1_allows(
             &context,
             &decision,
             decimal("0.76"),
@@ -8419,6 +8773,96 @@ mod tests {
             &context,
             &decision,
             decimal("0.76"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_blocks_transient_hot_chase() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("4.09", "13.74");
+        context.target = MarketTarget::Btc5m;
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(10);
+        context.exchange_book_age_ms = Some(20);
+        context.exchange_book_top_imbalance_bps = Decimal::from(10_000);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(5_546);
+        context.exchange_book_spread_bps = decimal("0.40");
+        context.spot_move_5s_bps = Decimal::ZERO;
+        context.spot_move_15s_bps = Decimal::ZERO;
+        let mut decision = test_codex_decision("0", "0");
+        decision.signal_strength_bps = Decimal::from(3_335);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.74"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.75"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(!codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.75"),
+            &book,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn codex_scalp_probe_v1_raw_light_blocks_hot_chase_without_swing_confirmation() {
+        let mut config = strategy_config();
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_entry_spread = decimal("0.20");
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+
+        let mut context = test_codex_context("7.80", "3.62");
+        context.target = MarketTarget::Bnb5m;
+        context.current_spot_source = "Coinbase::Level2".to_owned();
+        context.current_spot_received_age_ms = Some(46);
+        context.exchange_book_age_ms = Some(20);
+        context.exchange_book_top_imbalance_bps = Decimal::from(6_016);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(10_000);
+        context.exchange_book_spread_bps = decimal("0.40");
+        context.spot_move_5s_bps = decimal("10.22");
+        context.spot_move_15s_bps = Decimal::ZERO;
+        let mut decision = test_codex_decision("10.22", "0");
+        decision.signal_strength_bps = Decimal::from(6_016);
+        let book = OrderBook {
+            asset_id: "up".to_owned(),
+            bids: vec![BookLevel {
+                price: decimal("0.77"),
+                size: decimal("100"),
+            }],
+            asks: vec![BookLevel {
+                price: decimal("0.78"),
+                size: decimal("100"),
+            }],
+            min_order_size: None,
+            tick_size: None,
+        };
+
+        assert!(!codex_scalp_probe_v1_allows(
+            &context,
+            &decision,
+            decimal("0.78"),
             &book,
             &config,
         ));
@@ -8495,7 +8939,7 @@ mod tests {
             },
         );
 
-        let mut context = test_codex_context("8.00", "0.00");
+        let mut context = test_codex_context("5.00", "0.00");
         context.current_spot_source = "Binance::Trade".to_owned();
         context.current_spot_received_age_ms = Some(25);
         context.exchange_book_age_ms = Some(30);
@@ -8504,6 +8948,7 @@ mod tests {
         context.exchange_book_spread_bps = decimal("0.40");
         context.spot_move_5s_bps = decimal("14.00");
         context.spot_move_15s_bps = decimal("14.00");
+        context.micro_acceleration_bps = decimal("12.00");
         context.seconds_left = 275;
         let mut contexts = HashMap::new();
         contexts.insert(market.slug.clone(), context);
@@ -8542,6 +8987,105 @@ mod tests {
     }
 
     #[test]
+    fn codex_scalp_probe_v1_near_miss_reports_missing_premium_swing_confirmation() {
+        let mut config = strategy_config();
+        config.enable_bundle = false;
+        config.enable_directional = false;
+        config.enable_micro_breakout = false;
+        config.enable_target_state_v1 = false;
+        config.enable_bonereaper_state_v2 = false;
+        config.enable_bonereaper_state_guarded = false;
+        config.enable_codex_sentinel_v1 = false;
+        config.enable_codex_scalp_probe_v1 = true;
+        config.codex_scalp_probe_v1_raw_ablation_enabled = true;
+        config.codex_scalp_probe_v1_raw_light_enabled = true;
+        config.codex_scalp_probe_v1_min_elapsed_window_secs = 0;
+        config.codex_scalp_probe_v1_max_seconds_left = 295;
+        config.codex_scalp_probe_v1_min_seconds_left = 45;
+        config.codex_scalp_probe_v1_max_book_age_ms = 1_000;
+        config.codex_scalp_probe_v1_max_exchange_spread_bps = decimal("10.00");
+        config.codex_sentinel_v1_max_live_quote_age_ms = 3_000;
+        config.bonereaper_state_v2_bias_min_target_gap_bps = Decimal::ZERO;
+        config.bonereaper_state_v2_flip_max_target_gap_bps = Decimal::from(999);
+        config.bonereaper_state_v2_min_signal_bps = 0;
+        config.bonereaper_state_v2_min_spot_move_15s_bps = Decimal::ZERO;
+        config.bonereaper_state_v2_min_spot_move_5s_bps = Decimal::ZERO;
+        config.bonereaper_state_v2_min_aligned_flow_bps = Decimal::ZERO;
+
+        let strategy = BundleArbitrageStrategy::new(config);
+        let market = market();
+        let mut books = HashMap::new();
+        books.insert(
+            "up-token".to_owned(),
+            OrderBook {
+                asset_id: "up-token".to_owned(),
+                bids: vec![BookLevel {
+                    price: decimal("0.74"),
+                    size: decimal("150"),
+                }],
+                asks: vec![BookLevel {
+                    price: decimal("0.75"),
+                    size: decimal("150"),
+                }],
+                min_order_size: None,
+                tick_size: None,
+            },
+        );
+        books.insert(
+            "down-token".to_owned(),
+            OrderBook {
+                asset_id: "down-token".to_owned(),
+                bids: vec![BookLevel {
+                    price: decimal("0.24"),
+                    size: decimal("150"),
+                }],
+                asks: vec![BookLevel {
+                    price: decimal("0.25"),
+                    size: decimal("150"),
+                }],
+                min_order_size: None,
+                tick_size: None,
+            },
+        );
+
+        let mut context = test_codex_context("8.00", "13.74");
+        context.current_spot_source = "Binance::Trade".to_owned();
+        context.current_spot_received_age_ms = Some(25);
+        context.exchange_book_age_ms = Some(30);
+        context.exchange_book_top_imbalance_bps = Decimal::from(10_000);
+        context.exchange_book_depth_imbalance_bps = Decimal::from(10_000);
+        context.exchange_book_spread_bps = decimal("0.40");
+        context.spot_move_5s_bps = decimal("14.00");
+        context.spot_move_15s_bps = Decimal::ZERO;
+        context.seconds_left = 275;
+        let mut contexts = HashMap::new();
+        contexts.insert(market.slug.clone(), context);
+
+        let misses = strategy.find_near_misses(
+            std::slice::from_ref(&market),
+            &books,
+            &HashMap::new(),
+            &contexts,
+            &HashMap::new(),
+            1,
+        );
+
+        assert_eq!(misses.len(), 1);
+        assert!(
+            misses[0]
+                .reason
+                .contains("premium scalp lacks aligned 15s confirmation"),
+            "expected the premium 15s bucket, got: {}",
+            misses[0].reason
+        );
+        assert!(
+            misses[0].shortfall_label.contains("15s 0 < 8.00"),
+            "expected the 15s shortfall detail, got: {}",
+            misses[0].shortfall_label
+        );
+    }
+
+    #[test]
     fn codex_scalp_probe_v1_raw_light_respects_configured_v3_entry_window() {
         let mut config = strategy_config();
         config.codex_scalp_probe_v1_raw_ablation_enabled = true;
@@ -8565,7 +9109,7 @@ mod tests {
         context.exchange_book_spread_bps = decimal("0.40");
         context.seconds_left = 270;
         let mut decision = test_codex_decision("5.00", "5.00");
-        decision.signal_strength_bps = Decimal::from(24);
+        decision.signal_strength_bps = Decimal::from(3_500);
         let book = OrderBook {
             asset_id: "up".to_owned(),
             bids: vec![BookLevel {
@@ -8700,6 +9244,21 @@ mod tests {
         context.current_spot_source = "Coinbase::Ticker".to_owned();
         context.current_spot_event_age_ms = Some(856);
         context.current_spot_received_age_ms = Some(9);
+
+        assert!(!codex_sentinel_v1_live_quote_age_guard_blocks(
+            &context, &config,
+        ));
+    }
+
+    #[test]
+    fn codex_sentinel_v1_live_quote_age_guard_allows_recently_received_coinbase_l2_entry() {
+        let mut config = strategy_config();
+        config.codex_sentinel_v1_live_quote_age_guard_enabled = true;
+        config.codex_sentinel_v1_max_live_quote_age_ms = 750;
+        let mut context = test_codex_context("6.50", "3.60");
+        context.current_spot_source = "Coinbase::Level2".to_owned();
+        context.current_spot_event_age_ms = Some(2_100);
+        context.current_spot_received_age_ms = Some(40);
 
         assert!(!codex_sentinel_v1_live_quote_age_guard_blocks(
             &context, &config,

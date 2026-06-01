@@ -26,26 +26,32 @@ const DEFAULT_BONEREAPER_WALLET: &str = "0xeebde7a0e019a63e6b476eb425505b7b3e6eb
 
 /// CLI-точка входа для бота.
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Торговый бот для BTC 5m рынков Polymarket")]
+#[command(
+    author,
+    version,
+    about = "Polymarket research and paper-trading toolkit"
+)]
 pub struct Cli {
     /// Путь к TOML-конфигу.
     #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// Набор команд бота.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Просканировать активные BTC 5m рынки и вывести лучшие возможности.
+    /// Открыть интерактивное меню управления программой.
+    Menu,
+    /// Просканировать активные короткие crypto-рынки и вывести лучшие возможности.
     Scan {
         /// Сколько возможностей вывести.
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
-    /// Показать активные BTC 5m рынки и их текущие котировки.
+    /// Показать активные короткие crypto-рынки и их текущие котировки.
     Markets {
         /// Сколько рынков вывести.
         #[arg(long, default_value_t = 20)]
@@ -72,7 +78,6 @@ pub enum Command {
         #[arg(long)]
         cycles: Option<usize>,
     },
-    /// Вывести аналитику по локальному журналу исполнений.
     /// Show raw live price feeds from Binance, Coinbase, and Polymarket Chainlink RTDS.
     #[command(name = "price-monitor", alias = "prices")]
     PriceMonitor {
@@ -83,6 +88,7 @@ pub enum Command {
         #[arg(long)]
         cycles: Option<usize>,
     },
+    /// Прогнать стратегию по доступной локальной исторической выборке.
     Backtest {
         #[arg(long, default_value_t = 30)]
         windows_per_target: usize,
@@ -105,7 +111,7 @@ pub enum Command {
         #[arg(long)]
         target: Option<MarketTarget>,
     },
-    /// Sweep safe strategy thresholds against `PolyBackTest` and rank variants.
+    /// Перебрать параметры PolyBacktest и вывести рейтинг вариантов.
     #[command(name = "polybacktest-tune", alias = "poly-tune")]
     PolyBacktestTune {
         #[arg(long, default_value_t = 30)]
@@ -121,12 +127,13 @@ pub enum Command {
         #[arg(long)]
         max_variants: Option<usize>,
     },
+    /// Вывести аналитику по локальному журналу исполнений.
     Analytics {
         /// Максимальное число последних записей журнала для анализа.
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Проверить live-учётные данные Polymarket без выставления ордеров.
+    /// Показать сводку локального paper-журнала.
     #[command(name = "paper-report", alias = "paper_report")]
     PaperReport {
         #[arg(long)]
@@ -169,6 +176,7 @@ pub enum Command {
     /// Показать текущие открытые позиции paper-режима.
     #[command(name = "paper-positions", alias = "paper_positions")]
     PaperPositions,
+    /// Проверить live-учётные данные Polymarket без выставления ордеров.
     AuthCheck,
     /// Watch wallet activity from Polymarket Data API.
     #[command(name = "follow-wallet", alias = "follow")]
@@ -5305,7 +5313,7 @@ mod tests {
         );
         assert_eq!(config.run.reactive_debounce_ms, 0);
         assert!(config.run.allow_repeat_entries_same_window);
-        assert_eq!(config.run.repeat_entry_min_interval_ms, 500);
+        assert_eq!(config.run.repeat_entry_min_interval_ms, 0);
         assert!(!config.run.revalidate_before_execute);
         assert_eq!(config.run.execute_top_n, 3);
         assert!(config.run.early_exit.enabled);

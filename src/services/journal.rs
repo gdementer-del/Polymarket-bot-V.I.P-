@@ -33,6 +33,8 @@ pub struct JournalStore {
 /// Restored state snapshot used to resume trading after restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PnlSnapshot {
+    #[serde(default)]
+    pub run_id: String,
     pub updated_at: DateTime<Utc>,
     pub execution_count: u64,
     pub paper_state: PaperState,
@@ -42,6 +44,7 @@ pub struct PnlSnapshot {
 impl Default for PnlSnapshot {
     fn default() -> Self {
         Self {
+            run_id: String::new(),
             updated_at: Utc::now(),
             execution_count: 0,
             paper_state: PaperState::default(),
@@ -53,6 +56,8 @@ impl Default for PnlSnapshot {
 /// A single persisted execution entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
+    #[serde(default)]
+    pub run_id: String,
     pub recorded_at: DateTime<Utc>,
     pub opportunity: Opportunity,
     pub report: ExecutionReport,
@@ -80,6 +85,10 @@ impl PaperTradeAction {
 /// One persisted paper trade event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperTradeEntry {
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub position_id: String,
     pub recorded_at: DateTime<Utc>,
     pub action: PaperTradeAction,
     pub slug: String,
@@ -162,13 +171,19 @@ pub struct PaperCycleLatencyMetrics {
     pub revalidation_ms: u64,
     #[serde(default, rename = "latency_execution_ms")]
     pub execution_ms: u64,
+    #[serde(default, rename = "latency_persistence_enqueue_ms")]
+    pub persistence_enqueue_ms: u64,
     #[serde(default, rename = "latency_cycle_total_ms")]
     pub cycle_total_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperCycleEntry {
+    #[serde(default)]
+    pub run_id: String,
     pub recorded_at: DateTime<Utc>,
+    #[serde(default)]
+    pub trigger_source: Option<String>,
     pub total_markets: usize,
     pub live_markets: usize,
     pub strategy_fit_count: usize,
@@ -315,6 +330,11 @@ pub struct PaperReportMemory {
 type PaperJournalAck = StdSender<std::result::Result<(), String>>;
 
 enum PaperJournalCommand {
+    Execution {
+        snapshot: Box<PnlSnapshot>,
+        entry: Box<JournalEntry>,
+    },
+    Snapshot(Box<PnlSnapshot>),
     Trade(Box<PaperTradeEntry>),
     Cycle(Box<PaperCycleEntry>),
     CycleLatest(Box<PaperCycleEntry>),
@@ -328,6 +348,27 @@ pub struct PaperJournalWriter {
 }
 
 impl PaperJournalWriter {
+    /// Queue an execution journal append and snapshot refresh without blocking on disk IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer thread is no longer available.
+    pub fn record_execution(&self, snapshot: PnlSnapshot, entry: JournalEntry) -> Result<()> {
+        self.send(PaperJournalCommand::Execution {
+            snapshot: Box::new(snapshot),
+            entry: Box::new(entry),
+        })
+    }
+
+    /// Queue a snapshot-only refresh without blocking on disk IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer thread is no longer available.
+    pub fn record_snapshot(&self, snapshot: PnlSnapshot) -> Result<()> {
+        self.send(PaperJournalCommand::Snapshot(Box::new(snapshot)))
+    }
+
     /// Queue a paper trade write without blocking the runtime hot path on disk IO.
     ///
     /// # Errors
@@ -451,6 +492,18 @@ impl JournalStore {
             let mut last_error: Option<String> = None;
             while let Ok(command) = rx.recv() {
                 match command {
+                    PaperJournalCommand::Execution { snapshot, entry } => {
+                        if let Err(error) = store.persist_execution(&snapshot, &entry) {
+                            last_error = Some(error.to_string());
+                            warn!(error = %error, "failed to asynchronously persist execution");
+                        }
+                    }
+                    PaperJournalCommand::Snapshot(snapshot) => {
+                        if let Err(error) = store.persist_snapshot(&snapshot) {
+                            last_error = Some(error.to_string());
+                            warn!(error = %error, "failed to asynchronously persist paper snapshot");
+                        }
+                    }
                     PaperJournalCommand::Trade(entry) => {
                         if let Err(error) = store.record_paper_trade(&entry) {
                             last_error = Some(error.to_string());
@@ -553,6 +606,24 @@ impl JournalStore {
         paper_state: &PaperState,
         executed_market_slugs: &HashSet<String>,
     ) -> Result<()> {
+        let entry = Self::prepare_execution_in_place(
+            snapshot,
+            opportunity,
+            report,
+            paper_state,
+            executed_market_slugs,
+        );
+        self.persist_execution(snapshot, &entry)
+    }
+
+    /// Update an in-memory snapshot and build its execution entry without disk IO.
+    pub fn prepare_execution_in_place(
+        snapshot: &mut PnlSnapshot,
+        opportunity: &Opportunity,
+        report: &ExecutionReport,
+        paper_state: &PaperState,
+        executed_market_slugs: &HashSet<String>,
+    ) -> JournalEntry {
         snapshot.execution_count += 1;
         snapshot.updated_at = Utc::now();
         snapshot.paper_state = paper_state.clone();
@@ -560,24 +631,24 @@ impl JournalStore {
             .executed_market_slugs
             .clone_from(executed_market_slugs);
 
-        let entry = JournalEntry {
+        JournalEntry {
+            run_id: snapshot.run_id.clone(),
             recorded_at: snapshot.updated_at,
             opportunity: opportunity.clone(),
             report: report.clone(),
             paper_state: paper_state.clone(),
-        };
+        }
+    }
 
+    fn persist_execution(&self, snapshot: &PnlSnapshot, entry: &JournalEntry) -> Result<()> {
         let mut journal = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.execution_journal_path)?;
-        serde_json::to_writer(&mut journal, &entry)?;
+        serde_json::to_writer(&mut journal, entry)?;
         journal.write_all(b"\n")?;
 
-        let encoded = serde_json::to_vec(&snapshot)?;
-        fs::write(&self.pnl_snapshot_path, encoded)?;
-
-        Ok(())
+        self.persist_snapshot(snapshot)
     }
 
     /// Persist snapshot-only changes without appending a new execution entry.
@@ -606,13 +677,25 @@ impl JournalStore {
         paper_state: &PaperState,
         executed_market_slugs: &HashSet<String>,
     ) -> Result<()> {
+        Self::prepare_snapshot_update_in_place(snapshot, paper_state, executed_market_slugs);
+        self.persist_snapshot(snapshot)
+    }
+
+    /// Update an already-loaded snapshot without touching disk.
+    pub fn prepare_snapshot_update_in_place(
+        snapshot: &mut PnlSnapshot,
+        paper_state: &PaperState,
+        executed_market_slugs: &HashSet<String>,
+    ) {
         snapshot.updated_at = Utc::now();
         snapshot.paper_state = paper_state.clone();
         snapshot
             .executed_market_slugs
             .clone_from(executed_market_slugs);
+    }
 
-        let encoded = serde_json::to_vec(&snapshot)?;
+    fn persist_snapshot(&self, snapshot: &PnlSnapshot) -> Result<()> {
+        let encoded = serde_json::to_vec(snapshot)?;
         fs::write(&self.pnl_snapshot_path, encoded)?;
         Ok(())
     }
@@ -803,7 +886,39 @@ impl JournalStore {
     ///
     /// Returns an error if the cycle journal exists but cannot be read or parsed.
     pub fn load_paper_cycles(&self, limit: Option<usize>) -> Result<Vec<PaperCycleEntry>> {
-        load_jsonl_records(&self.paper_cycle_journal_path, limit)
+        let mut entries = Vec::new();
+        for path in self.paper_cycle_journal_paths()? {
+            entries.extend(load_jsonl_records(&path, None)?);
+        }
+        retain_last_records(&mut entries, limit);
+        Ok(entries)
+    }
+
+    fn paper_cycle_journal_paths(&self) -> Result<Vec<PathBuf>> {
+        let Some(directory) = self.paper_cycle_journal_path.parent() else {
+            return Ok(vec![self.paper_cycle_journal_path.clone()]);
+        };
+        let Some(file_name) = self
+            .paper_cycle_journal_path
+            .file_name()
+            .and_then(|value| value.to_str())
+        else {
+            return Ok(vec![self.paper_cycle_journal_path.clone()]);
+        };
+        let prefix = format!("{file_name}.rotated-");
+        let mut rotations = fs::read_dir(directory)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                name.starts_with(&prefix).then(|| entry.path())
+            })
+            .collect::<Vec<_>>();
+        rotations.sort();
+        if self.paper_cycle_journal_path.exists() {
+            rotations.push(self.paper_cycle_journal_path.clone());
+        }
+        Ok(rotations)
     }
 
     fn default_snapshot(&self) -> Result<PnlSnapshot> {
@@ -818,6 +933,7 @@ impl JournalStore {
         };
 
         if let Some(last_entry) = entries.last() {
+            snapshot.run_id.clone_from(&last_entry.run_id);
             snapshot.updated_at = last_entry.recorded_at;
             snapshot.paper_state = last_entry.paper_state.clone();
         }
@@ -858,14 +974,17 @@ where
         }
     }
 
+    retain_last_records(&mut entries, limit);
+    Ok(entries)
+}
+
+fn retain_last_records<T>(entries: &mut Vec<T>, limit: Option<usize>) {
     if let Some(limit) = limit
         && entries.len() > limit
     {
         let drain_len = entries.len() - limit;
         entries.drain(..drain_len);
     }
-
-    Ok(entries)
 }
 
 fn writer_channel_error<T>(_error: mpsc::SendError<T>) -> AppError {
@@ -903,7 +1022,7 @@ mod tests {
 
     use super::{
         JournalStore, PaperCycleCurrentMarketHealth, PaperCycleEntry, PaperCycleLatencyMetrics,
-        PaperReportMemory,
+        PaperReportMemory, PnlSnapshot,
     };
 
     fn temp_state_dir() -> PathBuf {
@@ -922,6 +1041,33 @@ mod tests {
         let ack = super::paper_writer_ack(Some("disk is read-only"));
 
         assert_eq!(ack, Err("disk is read-only".to_owned()));
+    }
+
+    #[test]
+    fn paper_writer_persists_run_snapshot_without_trade() {
+        let state_dir = temp_state_dir();
+        let store = JournalStore::new(&build_storage_config(state_dir.clone()))
+            .expect("journal store should initialize");
+        let writer = store.spawn_paper_writer();
+        let snapshot = PnlSnapshot {
+            run_id: "paper-empty-run".to_owned(),
+            ..PnlSnapshot::default()
+        };
+
+        writer
+            .record_snapshot(snapshot)
+            .expect("snapshot write should queue");
+        writer
+            .shutdown()
+            .expect("writer should drain queued snapshot");
+
+        let restored = store
+            .load_snapshot()
+            .expect("queued snapshot should deserialize");
+        assert_eq!(restored.run_id, "paper-empty-run");
+        assert_eq!(restored.execution_count, 0);
+
+        fs::remove_dir_all(state_dir).expect("temporary test directory should be removable");
     }
 
     fn build_storage_config(state_dir: PathBuf) -> StorageConfig {
@@ -1212,10 +1358,13 @@ mod tests {
     #[test]
     fn journal_persists_and_reads_paper_cycles() {
         let state_dir = temp_state_dir();
-        let store = JournalStore::new(&build_storage_config(state_dir.clone()))
-            .expect("journal store should initialize");
+        let mut storage = build_storage_config(state_dir.clone());
+        storage.paper_cycle_journal_max_bytes = 1;
+        let store = JournalStore::new(&storage).expect("journal store should initialize");
         let entry = PaperCycleEntry {
+            run_id: "test-run".to_owned(),
             recorded_at: chrono::Utc::now(),
+            trigger_source: Some("Polymarket::WS".to_owned()),
             total_markets: 12,
             live_markets: 1,
             strategy_fit_count: 2,
@@ -1301,6 +1450,7 @@ mod tests {
                 selection_ms: 2,
                 revalidation_ms: 1,
                 execution_ms: 5,
+                persistence_enqueue_ms: 1,
                 cycle_total_ms: 27,
             },
         };
@@ -1308,12 +1458,20 @@ mod tests {
         store
             .record_paper_cycle(&entry)
             .expect("paper cycle write should succeed");
+        let mut second_entry = entry.clone();
+        second_entry.run_id = "test-run-2".to_owned();
+        second_entry.opportunity_count = 2;
+        second_entry.top_opportunity_slug = Some("btc-updown-5m-2".to_owned());
+        store
+            .record_paper_cycle(&second_entry)
+            .expect("second paper cycle write should rotate the first entry");
         let loaded = store
             .load_paper_cycles(Some(10))
             .expect("paper cycles should deserialize successfully");
 
-        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].opportunity_count, 1);
+        assert_eq!(loaded[0].trigger_source.as_deref(), Some("Polymarket::WS"));
         assert_eq!(
             loaded[0].top_opportunity_slug.as_deref(),
             Some("btc-updown-5m-1")
@@ -1323,6 +1481,16 @@ mod tests {
             loaded[0].top_near_miss_target_gap_bps.as_deref(),
             Some("10.5")
         );
+        assert_eq!(loaded[1].opportunity_count, 2);
+        assert_eq!(
+            loaded[1].top_opportunity_slug.as_deref(),
+            Some("btc-updown-5m-2")
+        );
+        let limited = store
+            .load_paper_cycles(Some(1))
+            .expect("paper cycle limit should apply across active and rotated journals");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].run_id, "test-run-2");
         let latest = store
             .load_latest_paper_cycle()
             .expect("latest paper cycle should deserialize successfully");
@@ -1331,7 +1499,7 @@ mod tests {
             latest
                 .as_ref()
                 .and_then(|cycle| cycle.top_opportunity_slug.as_deref()),
-            Some("btc-updown-5m-1")
+            Some("btc-updown-5m-2")
         );
 
         fs::remove_dir_all(state_dir).expect("temporary test directory should be removable");

@@ -80,6 +80,8 @@ const MARKET_DATA_WARMUP_TIMEOUT_MS: u64 = 12_000;
 const MARKET_DATA_WARMUP_POLL_MS: u64 = 100;
 const MARKET_DATA_WARMUP_MAX_QUOTE_AGE_MS: i64 = 2_000;
 const MARKET_DATA_WARMUP_MAX_DEPTH_AGE_MS: i64 = 2_000;
+const RUNTIME_MARKET_DISCOVERY_REFRESH_MS: u64 = 2_000;
+const RUNTIME_BINANCE_INTERVAL_OPEN_REFRESH_MS: u64 = 2_000;
 
 #[derive(Debug, Clone)]
 struct RuntimeTriggerEvent {
@@ -132,8 +134,8 @@ impl RuntimeTriggerEvent {
             symbol: "POLYMARKET".to_owned(),
             event_time_ms: now_ms,
             received_time_ms: now_ms,
-            price: Decimal::ZERO,
-            source: format!("Polymarket::{revision}"),
+            price: Decimal::from(revision),
+            source: "Polymarket::WS".to_owned(),
         }
     }
 
@@ -157,7 +159,14 @@ impl RuntimeTriggerEvent {
 /// Returns an error if config loading, market fetching, or execution fails.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<()> {
-    match &cli.command {
+    let Some(command) = cli.command else {
+        return super::menu::run(&cli.config);
+    };
+    if matches!(command, Command::Menu) {
+        return super::menu::run(&cli.config);
+    }
+
+    match &command {
         Command::FollowWalletReport {
             input: Some(input),
             limit,
@@ -252,7 +261,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     });
     let strategy = BundleArbitrageStrategy::new(config.strategy.clone());
 
-    match cli.command {
+    match command {
+        Command::Menu => unreachable!("menu command is handled before config loading"),
         Command::Scan { top } => {
             scan_once(&config, &data_client, &binance_client, &strategy, top).await
         }
@@ -659,6 +669,7 @@ async fn run_loop(
     let max_runtime = control.max_runtime_secs.map(StdDuration::from_secs);
     let max_drain = StdDuration::from_secs(control.max_drain_secs.max(1));
     let run_started_at = Instant::now();
+    let run_id = new_runtime_run_id(mode);
     let mut drain_started_at: Option<Instant> = None;
     let journal = JournalStore::new(&config.storage)?;
     let paper_journal = (mode == BotMode::Paper).then(|| journal.spawn_paper_writer());
@@ -669,7 +680,10 @@ async fn run_loop(
         mut executed_market_slugs,
         paper,
         mut risk_tracker,
-    } = bootstrap_paper_runtime(config, &journal, mode)?;
+    } = bootstrap_paper_runtime(config, &journal, mode, &run_id)?;
+    if let Some(writer) = paper_journal.as_ref() {
+        writer.record_snapshot(journal_snapshot.clone())?;
+    }
     let mut reversed_market_slugs = HashSet::<String>::new();
     let mut v4_inventory_tracker = V4InventoryTracker::default();
     let mut repeat_entry_throttle = HashMap::<String, Instant>::new();
@@ -681,8 +695,11 @@ async fn run_loop(
         .then(|| data_client.subscribe_market_triggers());
 
     start_runtime_market_streams(config, data_client, binance_client, coinbase_client);
-    prewarm_runtime_polymarket_stream(config, data_client).await;
-    warm_up_runtime_market_data(config, binance_client).await;
+    let market_discovery_refresh_task =
+        spawn_runtime_market_discovery_refresher(config, data_client);
+    let market_data_warmup_task = spawn_runtime_market_data_warmup_observer(config, binance_client);
+    let binance_context_refresh_task =
+        spawn_runtime_binance_context_refresher(config, data_client, binance_client);
 
     if mode == BotMode::Live {
         let geo = data_client.geoblock_status().await?;
@@ -735,6 +752,7 @@ async fn run_loop(
                 &journal,
                 binance_client,
                 &paper,
+                &run_id,
                 &executed_market_slugs,
                 &mut journal_snapshot,
                 paper_journal.as_ref(),
@@ -772,7 +790,7 @@ async fn run_loop(
                 Err(error) => {
                     warn!(
                         error = %error,
-                        "exit- ;"
+                        "exit market snapshot unavailable; retrying on the next trigger"
                     );
                     continue;
                 }
@@ -785,6 +803,7 @@ async fn run_loop(
                 &exit_snapshot,
                 &config.run.early_exit,
                 paper_cost_model_from_config(config),
+                &run_id,
                 &executed_market_slugs,
                 &mut journal_snapshot,
                 paper_journal.as_ref(),
@@ -843,7 +862,7 @@ async fn run_loop(
             Err(error) => {
                 warn!(
                     error = %error,
-                    "runtime- ;"
+                    "runtime analysis frame unavailable; retrying on the next trigger"
                 );
                 continue;
             }
@@ -927,7 +946,7 @@ async fn run_loop(
                     daily_realized_profit = %risk_tracker.daily_realized_profit.round_dp(4),
                     consecutive_losses = risk_tracker.consecutive_losses,
                     cooldown_cycles_left = risk_tracker.cooldown_remaining_cycles,
-                    ": risk kill-switch"
+                    "risk kill-switch blocked entries"
                 );
             }
         }
@@ -935,6 +954,7 @@ async fn run_loop(
         let mut executed_count = 0_usize;
         let execution_started_at = Instant::now();
         let mut revalidation_ms = 0_u64;
+        let mut persistence_enqueue_ms = 0_u64;
 
         if opportunities.is_empty() {
             debug!("no opportunities in current cycle");
@@ -964,7 +984,7 @@ async fn run_loop(
                             .saturating_add(duration_ms_u64(revalidation_started_at.elapsed()));
                         warn!(
                             slug = %selected_opportunity.slug,
-                            ","
+                            "selected opportunity disappeared during revalidation"
                         );
                         continue;
                     };
@@ -1006,7 +1026,7 @@ async fn run_loop(
                     &executed_market_slugs,
                     &opportunity,
                 ) {
-                    info!(
+                    debug!(
                         slug = %opportunity.slug,
                         kind = opportunity.kind.as_str(),
                         reason = %reason,
@@ -1080,7 +1100,9 @@ async fn run_loop(
                     BotMode::Paper => execute_and_log(&paper, &opportunity).await?,
                     BotMode::Live => {
                         let Some(live_executor) = live.as_ref() else {
-                            return Err(AppError::LiveExecution("live-".to_owned()));
+                            return Err(AppError::LiveExecution(
+                                "live executor is unavailable".to_owned(),
+                            ));
                         };
                         execute_and_log(live_executor, &opportunity).await?
                     }
@@ -1094,7 +1116,13 @@ async fn run_loop(
                     paper.record_fill(&opportunity).await
                 };
                 if mode == BotMode::Paper {
-                    let open_trade = build_paper_open_trade(&opportunity, &report);
+                    let position_id = paper_state
+                        .open_positions
+                        .get(&opportunity.slug)
+                        .map(|position| position.position_id.as_str())
+                        .unwrap_or_default();
+                    let open_trade =
+                        build_paper_open_trade(&run_id, position_id, &opportunity, &report);
                     if let Some(writer) = paper_journal.as_ref() {
                         writer.record_trade(open_trade)?;
                     } else {
@@ -1106,19 +1134,34 @@ async fn run_loop(
                 if stop_and_reverse_slugs.contains(&opportunity.slug) {
                     reversed_market_slugs.insert(opportunity.slug.clone());
                 }
-                journal.record_execution_in_place(
-                    &mut journal_snapshot,
-                    &opportunity,
-                    &report,
-                    &paper_state,
-                    &executed_market_slugs,
-                )?;
+                let persistence_started_at = Instant::now();
+                if mode == BotMode::Paper
+                    && let Some(writer) = paper_journal.as_ref()
+                {
+                    let entry = JournalStore::prepare_execution_in_place(
+                        &mut journal_snapshot,
+                        &opportunity,
+                        &report,
+                        &paper_state,
+                        &executed_market_slugs,
+                    );
+                    writer.record_execution(journal_snapshot.clone(), entry)?;
+                } else {
+                    journal.record_execution_in_place(
+                        &mut journal_snapshot,
+                        &opportunity,
+                        &report,
+                        &paper_state,
+                        &executed_market_slugs,
+                    )?;
+                }
+                persistence_enqueue_ms = persistence_enqueue_ms
+                    .saturating_add(duration_ms_u64(persistence_started_at.elapsed()));
                 record_repeat_entry_throttle(
                     &mut repeat_entry_throttle,
                     &opportunity,
                     repeat_entry_observed_at,
                 );
-                flush_paper_journal_if_needed(paper_journal.as_ref())?;
                 executed_count += 1;
                 info!(
                     mode = %report.mode,
@@ -1136,6 +1179,7 @@ async fn run_loop(
         }
         latency.revalidation_ms = revalidation_ms;
         latency.execution_ms = duration_ms_u64(execution_started_at.elapsed());
+        latency.persistence_enqueue_ms = persistence_enqueue_ms;
         latency.cycle_total_ms = duration_ms_u64(cycle_started_at.elapsed());
         let runtime_summary =
             build_runtime_snapshot_summary(&runtime_snapshot, &opportunities, latency);
@@ -1146,7 +1190,7 @@ async fn run_loop(
             let paper_state = paper.snapshot().await;
             let open_position_count = paper_state.open_positions.len();
             open_positions_after_cycle = Some(open_position_count);
-            let cycle_entry = build_paper_cycle_entry(
+            let mut cycle_entry = build_paper_cycle_entry(
                 config,
                 &runtime_snapshot,
                 &runtime_summary,
@@ -1159,7 +1203,9 @@ async fn run_loop(
                 regime_reason.as_deref(),
                 risk_block_reason.as_deref(),
                 &risk_tracker,
+                trigger.as_ref().map(|trigger| trigger.source.as_str()),
             );
+            cycle_entry.run_id.clone_from(&run_id);
             let append_cycle = should_append_paper_cycle_journal(
                 &cycle_entry,
                 last_paper_cycle_journal_append_at,
@@ -1221,6 +1267,15 @@ async fn run_loop(
         }
     }
 
+    if let Some(task) = market_discovery_refresh_task {
+        task.abort();
+    }
+    if let Some(task) = market_data_warmup_task {
+        task.abort();
+    }
+    if let Some(task) = binance_context_refresh_task {
+        task.abort();
+    }
     if let Some(writer) = paper_journal {
         writer.shutdown()?;
     }
@@ -1239,16 +1294,18 @@ fn bootstrap_paper_runtime(
     config: &AppConfig,
     journal: &JournalStore,
     mode: BotMode,
+    run_id: &str,
 ) -> Result<PaperRuntimeBootstrap> {
     let restore_paper_state = config.run.should_restore_paper_state_on_start();
     let seed_risk_from_history = config.run.should_seed_risk_from_history();
     let paper_start_mode = config.run.effective_paper_start_mode();
-    let journal_snapshot = if mode == BotMode::Paper && !restore_paper_state {
-        info!("paper-state");
+    let mut journal_snapshot = if mode == BotMode::Paper && !restore_paper_state {
+        info!("starting isolated paper state");
         PnlSnapshot::default()
     } else {
         journal.load_snapshot()?
     };
+    journal_snapshot.run_id = run_id.to_owned();
     let executed_market_slugs = journal_snapshot.executed_market_slugs.clone();
     if restore_paper_state && journal_snapshot.execution_count > 0 {
         info!(
@@ -1280,7 +1337,7 @@ fn bootstrap_paper_runtime(
         reset_daily_on_start = config.run.risk.reset_daily_on_start,
         seeded_daily_realized_profit = %risk_seed.daily_realized_profit.round_dp(4),
         seeded_consecutive_losses = risk_seed.consecutive_losses,
-        "-"
+        "initialized paper risk tracker"
     );
     let risk_tracker = RiskTracker::new(
         session_start_realized_profit,
@@ -1294,6 +1351,18 @@ fn bootstrap_paper_runtime(
         paper,
         risk_tracker,
     })
+}
+
+fn new_runtime_run_id(mode: BotMode) -> String {
+    let mode_label = match mode {
+        BotMode::Paper => "paper",
+        BotMode::Live => "live",
+    };
+    format!(
+        "{mode_label}-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        std::process::id()
+    )
 }
 
 fn paper_cost_model_from_config(config: &AppConfig) -> PaperCostModel {
@@ -1425,9 +1494,12 @@ fn start_runtime_market_streams(
 ) {
     for symbol in configured_binance_symbols(config) {
         if binance_client.start_trade_stream(symbol) {
-            info!(symbol, "websocket- Binance");
+            info!(symbol, "started Binance trade websocket");
         } else {
-            warn!("websocket- Binance");
+            warn!(
+                symbol,
+                "Binance trade websocket was already started or unavailable"
+            );
         }
     }
 
@@ -1463,7 +1535,7 @@ fn start_runtime_market_streams(
 
     if config.run.polymarket_stream.enabled {
         data_client.ensure_market_stream_started();
-        info!("websocket- Polymarket");
+        info!("started Polymarket market websocket");
     }
 }
 
@@ -1619,30 +1691,96 @@ async fn wait_for_price_monitor_trigger(
     }
 }
 
-async fn prewarm_runtime_polymarket_stream(config: &AppConfig, data_client: &MarketDataClient) {
+fn spawn_runtime_market_discovery_refresher(
+    config: &AppConfig,
+    data_client: &MarketDataClient,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !config.run.polymarket_stream.enabled {
-        return;
+        return None;
     }
 
-    match fetch_current_live_markets(data_client, &config.strategy.market_targets).await {
-        Ok(markets) if markets.is_empty() => {
-            warn!("Polymarket stream prewarm found no current live markets");
+    let client = data_client.clone();
+    let targets = config.strategy.market_targets.clone();
+    Some(tokio::spawn(async move {
+        let mut first_refresh = true;
+        loop {
+            if first_refresh {
+                match client
+                    .fetch_current_live_markets_for_prewarm(&targets)
+                    .await
+                {
+                    Ok(markets) if markets.is_empty() => {
+                        warn!("initial Polymarket current-window prewarm found no live markets");
+                    }
+                    Ok(markets) => {
+                        let market_count = markets.len();
+                        client.register_live_markets(&markets).await;
+                        info!(
+                            markets = market_count,
+                            "prewarmed current Polymarket windows before future-window discovery"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "initial Polymarket current-window prewarm failed; continuing with full background discovery"
+                        );
+                    }
+                }
+            }
+
+            match client.fetch_cached_current_live_markets(&targets).await {
+                Ok(markets) if markets.is_empty() => {
+                    if first_refresh {
+                        warn!("Polymarket stream prewarm found no current live markets");
+                    } else {
+                        debug!("background Polymarket market discovery found no live markets");
+                    }
+                }
+                Ok(markets) => {
+                    let market_count = markets.len();
+                    client.register_live_markets(&markets).await;
+                    if first_refresh {
+                        info!(
+                            markets = market_count,
+                            "prewarmed Polymarket live stream subscriptions"
+                        );
+                    } else {
+                        debug!(
+                            markets = market_count,
+                            "background Polymarket market discovery refresh complete"
+                        );
+                    }
+                }
+                Err(error) => {
+                    if first_refresh {
+                        warn!(
+                            error = %error,
+                            "Polymarket stream prewarm failed; background discovery refresher will retry"
+                        );
+                    } else {
+                        debug!(
+                            error = %error,
+                            "background Polymarket market discovery refresh failed"
+                        );
+                    }
+                }
+            }
+            first_refresh = false;
+            sleep(Duration::from_millis(RUNTIME_MARKET_DISCOVERY_REFRESH_MS)).await;
         }
-        Ok(markets) => {
-            let market_count = markets.len();
-            data_client.register_live_markets(&markets).await;
-            info!(
-                markets = market_count,
-                "prewarmed Polymarket live stream subscriptions"
-            );
-        }
-        Err(error) => {
-            warn!(
-                error = %error,
-                "Polymarket stream prewarm failed; reactive loop will retry from hot path"
-            );
-        }
-    }
+    }))
+}
+
+fn spawn_runtime_market_data_warmup_observer(
+    config: &AppConfig,
+    binance_client: &BinanceClient,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let config = config.clone();
+    let binance_client = binance_client.clone();
+    Some(tokio::spawn(async move {
+        warm_up_runtime_market_data(&config, &binance_client).await;
+    }))
 }
 
 async fn warm_up_runtime_market_data(config: &AppConfig, binance_client: &BinanceClient) {
@@ -1687,6 +1825,104 @@ async fn warm_up_runtime_market_data(config: &AppConfig, binance_client: &Binanc
 
         sleep(Duration::from_millis(MARKET_DATA_WARMUP_POLL_MS)).await;
     }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeBinanceIntervalOpenRefresh {
+    markets: usize,
+    interval_opens: usize,
+    failures: usize,
+}
+
+fn spawn_runtime_binance_context_refresher(
+    config: &AppConfig,
+    data_client: &MarketDataClient,
+    binance_client: &BinanceClient,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.run.reactive || !should_use_live_only_polymarket_books(config) {
+        return None;
+    }
+
+    let data_client = data_client.clone();
+    let binance_client = binance_client.clone();
+    let targets = config.strategy.market_targets.clone();
+    Some(tokio::spawn(async move {
+        let mut first_refresh = true;
+        loop {
+            let report =
+                refresh_runtime_binance_interval_opens(&data_client, &binance_client, &targets)
+                    .await;
+            if report.markets == 0 {
+                debug!("runtime exchange interval-open prewarm waiting for market discovery");
+            } else if report.failures == 0 {
+                if first_refresh {
+                    info!(
+                        markets = report.markets,
+                        interval_opens = report.interval_opens,
+                        "prewarmed runtime exchange interval opens"
+                    );
+                } else {
+                    debug!(
+                        markets = report.markets,
+                        interval_opens = report.interval_opens,
+                        "background runtime exchange interval-open refresh complete"
+                    );
+                }
+            } else {
+                warn!(
+                    markets = report.markets,
+                    interval_opens = report.interval_opens,
+                    failures = report.failures,
+                    "background runtime exchange interval-open refresh incomplete"
+                );
+            }
+            first_refresh = false;
+            sleep(Duration::from_millis(
+                RUNTIME_BINANCE_INTERVAL_OPEN_REFRESH_MS,
+            ))
+            .await;
+        }
+    }))
+}
+
+async fn refresh_runtime_binance_interval_opens(
+    data_client: &MarketDataClient,
+    binance_client: &BinanceClient,
+    targets: &[MarketTarget],
+) -> RuntimeBinanceIntervalOpenRefresh {
+    let observed_ts = data_client.current_server_time_secs_fast().await;
+    let markets = data_client
+        .cached_current_live_markets(targets)
+        .await
+        .into_iter()
+        .filter(|market| market_window_is_live_at(market, observed_ts))
+        .collect::<Vec<_>>();
+    let results = join_all(markets.iter().map(|market| async move {
+        (
+            market.slug.clone(),
+            binance_client.prewarm_market_interval_open(market).await,
+        )
+    }))
+    .await;
+    let mut report = RuntimeBinanceIntervalOpenRefresh {
+        markets: markets.len(),
+        ..RuntimeBinanceIntervalOpenRefresh::default()
+    };
+    for (slug, result) in results {
+        match result {
+            Ok(true) => report.interval_opens += 1,
+            Ok(false) => {}
+            Err(error) => {
+                report.failures += 1;
+                debug!(
+                    slug,
+                    error = %error,
+                    "runtime exchange interval-open refresh skipped a market"
+                );
+            }
+        }
+    }
+    report
 }
 
 fn format_live_market_data_health(health: &[LiveMarketDataHealth]) -> String {
@@ -2041,11 +2277,13 @@ fn repeated_entry_block_reason(
         1_u32.saturating_add(config.run.scale_in.max_additional_entries_per_window);
     let entry_count = existing_position.entry_count.max(1);
     if entry_count >= max_total_entries {
-        return Some(format!(": {entry_count} {max_total_entries}"));
+        return Some(format!(
+            "scale-in entry limit reached: {entry_count} >= {max_total_entries}"
+        ));
     }
 
     if !position_matches_opportunity(existing_position, opportunity) {
-        return Some(",".to_owned());
+        return Some("scale-in side does not match the open position".to_owned());
     }
 
     let signal_upgrade = allows_signal_upgrade(config, existing_position, opportunity);
@@ -2057,9 +2295,9 @@ fn repeated_entry_block_reason(
         && !signal_upgrade
     {
         return Some(format!(
-            "{}: {}",
-            config.run.scale_in.min_price_improvement.round_dp(4),
-            price_improvement.round_dp(4)
+            "scale-in price improvement is too small: {} < {}",
+            price_improvement.round_dp(4),
+            config.run.scale_in.min_price_improvement.round_dp(4)
         ));
     }
 
@@ -2069,9 +2307,9 @@ fn repeated_entry_block_reason(
         let impulse_improvement = (current_impulse - previous_impulse).round_dp(4);
         if impulse_improvement < config.run.scale_in.min_impulse_improvement_bps {
             return Some(format!(
-                "Binance {} bps: {} bps",
-                config.run.scale_in.min_impulse_improvement_bps.round_dp(4),
-                impulse_improvement.round_dp(4)
+                "scale-in Binance impulse improvement is too small: {} < {} bps",
+                impulse_improvement.round_dp(4),
+                config.run.scale_in.min_impulse_improvement_bps.round_dp(4)
             ));
         }
     }
@@ -2369,7 +2607,7 @@ fn collect_stop_and_reverse_opportunities(
         .filter(|report| is_stop_and_reverse_reason(&report.close_reason, &config.run.early_exit))
         .filter(|report| !reversed_market_slugs.contains(&report.slug))
         .filter_map(|report| {
-            let previous_side = PaperOutcomeSide::from_label(&report.dominant_outcome_at_entry);
+            let previous_side = PaperOutcomeSide::from_label(&report.primary_outcome_at_entry);
             let reverse = opportunities.iter().find(|opportunity| {
                 opportunity.slug == report.slug
                     && PaperOutcomeSide::from_label(&opportunity.primary_outcome_label)
@@ -2609,7 +2847,7 @@ impl RiskTracker {
             && daily_equity_profit <= -risk.max_daily_loss_usdc
         {
             Some(format!(
-                ": {} <= -{} USDC",
+                "daily equity loss limit reached: {} <= -{} USDC",
                 daily_equity_profit.round_dp(4),
                 risk.max_daily_loss_usdc.round_dp(4)
             ))
@@ -2617,7 +2855,7 @@ impl RiskTracker {
             && session_equity_profit <= -risk.max_session_loss_usdc
         {
             Some(format!(
-                ": {} <= -{} USDC",
+                "session equity loss limit reached: {} <= -{} USDC",
                 session_equity_profit.round_dp(4),
                 risk.max_session_loss_usdc.round_dp(4)
             ))
@@ -2625,7 +2863,7 @@ impl RiskTracker {
             && self.consecutive_losses >= risk.max_consecutive_losses
         {
             Some(format!(
-                ": {} >= {}",
+                "consecutive loss limit reached: {} >= {}",
                 self.consecutive_losses, risk.max_consecutive_losses
             ))
         } else {
@@ -3657,9 +3895,9 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
         .collect::<HashSet<_>>()
         .len();
 
-    let _ = writeln!(output, ": {}", records.len());
-    let _ = writeln!(output, ": {first_ts} -> {last_ts}");
-    let _ = writeln!(output, ": {unique_slugs}");
+    let _ = writeln!(output, "Records: {}", records.len());
+    let _ = writeln!(output, "Period: {first_ts} -> {last_ts}");
+    let _ = writeln!(output, "Unique slugs: {unique_slugs}");
     let _ = writeln!(output, "USDC: {}", total_usdc.round_dp(4));
 
     let mut by_side = BTreeMap::<String, WalletActivityAggregate>::new();
@@ -3807,7 +4045,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "side:");
+    let _ = writeln!(output, "Side:");
     for (side, aggregate) in by_side {
         let _ = writeln!(
             output,
@@ -3818,7 +4056,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "activity_type:");
+    let _ = writeln!(output, "Activity type:");
     for (activity_type, aggregate) in by_activity_type {
         let _ = writeln!(
             output,
@@ -3829,7 +4067,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "outcome:");
+    let _ = writeln!(output, "Outcome:");
     for (outcome, aggregate) in by_outcome {
         let _ = writeln!(
             output,
@@ -3840,7 +4078,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "Summary:");
+    let _ = writeln!(output, "Minute buckets:");
     for (minutes, aggregate) in by_minutes {
         let _ = writeln!(
             output,
@@ -3851,7 +4089,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, ":");
+    let _ = writeln!(output, "Seconds-left buckets:");
     for (bucket, aggregate) in by_seconds_left_bucket {
         let _ = writeln!(
             output,
@@ -3863,7 +4101,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "target_gap_bps:");
+    let _ = writeln!(output, "Target-gap buckets:");
     for (bucket, aggregate) in by_target_gap_bucket {
         let _ = writeln!(
             output,
@@ -3875,7 +4113,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, ":");
+    let _ = writeln!(output, "Selected-ask buckets:");
     for (bucket, aggregate) in by_selected_ask_bucket {
         let _ = writeln!(
             output,
@@ -3886,7 +4124,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "target_gap:");
+    let _ = writeln!(output, "Target alignment:");
     for (bucket, aggregate) in by_target_alignment {
         let _ = writeln!(
             output,
@@ -3898,7 +4136,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, ":");
+    let _ = writeln!(output, "Progress buckets:");
     for (bucket, aggregate) in by_progress_bucket {
         let _ = writeln!(
             output,
@@ -3910,7 +4148,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "discount ask:");
+    let _ = writeln!(output, "Discount-to-ask buckets:");
     for (bucket, aggregate) in by_discount_bucket {
         let _ = writeln!(
             output,
@@ -3922,7 +4160,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, "spread :");
+    let _ = writeln!(output, "Spread buckets:");
     for (bucket, aggregate) in by_spread_bucket {
         let _ = writeln!(
             output,
@@ -3934,7 +4172,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     }
 
     let _ = writeln!(output);
-    let _ = writeln!(output, ":");
+    let _ = writeln!(output, "Trade-size buckets:");
     for (bucket, aggregate) in by_trade_size_bucket {
         let _ = writeln!(
             output,
@@ -3955,7 +4193,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
     });
 
     let _ = writeln!(output);
-    let _ = writeln!(output, ":");
+    let _ = writeln!(output, "Top slugs:");
     for (slug, aggregate) in top_slugs.into_iter().take(top) {
         let avg_trade_price =
             average_decimal(aggregate.sum_activity_price, aggregate.activity_price_count);
@@ -3986,7 +4224,7 @@ fn render_wallet_activity_summary(records: &[WalletActivitySnapshotRecord], top:
         let _ = writeln!(output);
         let _ = writeln!(
             output,
-            "slug: repeated_streaks={repeated_streaks} repeated_trades={repeated_trade_count}",
+            "Repeated-slug streaks={repeated_streaks} repeated_trades={repeated_trade_count}",
         );
         let _ = writeln!(output, "slug:");
 
@@ -4940,27 +5178,25 @@ fn limit_for_since_load(limit: Option<usize>, since: Option<DateTime<Utc>>) -> O
 fn filter_paper_trades_since(
     trades: Vec<PaperTradeEntry>,
     since: Option<DateTime<Utc>>,
+    run_id: Option<&str>,
 ) -> Vec<PaperTradeEntry> {
-    match since {
-        Some(start) => trades
-            .into_iter()
-            .filter(|trade| trade.recorded_at >= start)
-            .collect(),
-        None => trades,
-    }
+    trades
+        .into_iter()
+        .filter(|trade| since.is_none_or(|start| trade.recorded_at >= start))
+        .filter(|trade| run_id.is_none_or(|run_id| trade.run_id == run_id))
+        .collect()
 }
 
 fn filter_paper_cycles_since(
     cycles: Vec<PaperCycleEntry>,
     since: Option<DateTime<Utc>>,
+    run_id: Option<&str>,
 ) -> Vec<PaperCycleEntry> {
-    match since {
-        Some(start) => cycles
-            .into_iter()
-            .filter(|cycle| cycle.recorded_at >= start)
-            .collect(),
-        None => cycles,
-    }
+    cycles
+        .into_iter()
+        .filter(|cycle| since.is_none_or(|start| cycle.recorded_at >= start))
+        .filter(|cycle| run_id.is_none_or(|run_id| cycle.run_id == run_id))
+        .collect()
 }
 
 fn limit_recent_paper_trades(
@@ -4976,9 +5212,9 @@ fn limit_recent_paper_trades(
     trades
 }
 
-fn since_label(since: Option<DateTime<Utc>>) -> String {
+fn since_label(since: Option<DateTime<Utc>>, run_id: Option<&str>) -> String {
     since.map_or_else(
-        || "all".to_owned(),
+        || run_id.map_or_else(|| "all".to_owned(), |run_id| format!("run {run_id}")),
         |start| {
             format!(
                 "since {}",
@@ -4988,11 +5224,27 @@ fn since_label(since: Option<DateTime<Utc>>) -> String {
     )
 }
 
+fn latest_paper_run_id(
+    journal: &JournalStore,
+    since: Option<DateTime<Utc>>,
+) -> Result<Option<String>> {
+    if since.is_some() {
+        return Ok(None);
+    }
+
+    let run_id = journal.load_snapshot()?.run_id;
+    Ok((!run_id.is_empty()).then_some(run_id))
+}
+
 fn show_paper_trades(config: &AppConfig, limit: Option<usize>, since: Option<&str>) -> Result<()> {
     let journal = JournalStore::new(&config.storage)?;
     let since_filter = parse_since_filter(since)?;
+    let run_id = latest_paper_run_id(&journal, since_filter)?;
     let trades = journal.load_paper_trades(limit_for_since_load(limit, since_filter))?;
-    let trades = limit_recent_paper_trades(filter_paper_trades_since(trades, since_filter), limit);
+    let trades = limit_recent_paper_trades(
+        filter_paper_trades_since(trades, since_filter, run_id.as_deref()),
+        limit,
+    );
     if trades.is_empty() {
         println!("Paper trade journal is empty for the selected range.");
         return Ok(());
@@ -5002,7 +5254,7 @@ fn show_paper_trades(config: &AppConfig, limit: Option<usize>, since: Option<&st
 
     println!(
         "Paper trades: range={} events={} open={} close={} wins={} losses={} realized_profit={} win_rate_pct={} expectancy={} profit_factor={} max_drawdown={}",
-        since_label(since_filter),
+        since_label(since_filter, run_id.as_deref()),
         trades.len(),
         post_trade.open_count,
         post_trade.close_count,
@@ -5022,13 +5274,22 @@ fn show_paper_trades(config: &AppConfig, limit: Option<usize>, since: Option<&st
 fn show_paper_quality(config: &AppConfig, limit: Option<usize>, since: Option<&str>) -> Result<()> {
     let journal = JournalStore::new(&config.storage)?;
     let since_filter = parse_since_filter(since)?;
-    let trades = filter_paper_trades_since(journal.load_paper_trades(None)?, since_filter);
+    let run_id = latest_paper_run_id(&journal, since_filter)?;
+    let trades = filter_paper_trades_since(
+        journal.load_paper_trades(None)?,
+        since_filter,
+        run_id.as_deref(),
+    );
     if trades.is_empty() {
         println!("Paper trade journal is empty for the selected range.");
         return Ok(());
     }
 
-    let cycles = filter_paper_cycles_since(journal.load_paper_cycles(None)?, since_filter);
+    let cycles = filter_paper_cycles_since(
+        journal.load_paper_cycles(None)?,
+        since_filter,
+        run_id.as_deref(),
+    );
     let closed_trades = pair_paper_quality_trades(&trades, &cycles);
     if closed_trades.is_empty() {
         println!("Paper quality report has no closed trades in the selected range yet.");
@@ -5041,7 +5302,7 @@ fn show_paper_quality(config: &AppConfig, limit: Option<usize>, since: Option<&s
 
     println!(
         "Paper quality: range={} closed_total={} displayed={} wins={} losses={} realized_profit={} expectancy={} win_rate_pct={} avg_mfe={} avg_mae={}",
-        since_label(since_filter),
+        since_label(since_filter, run_id.as_deref()),
         total_closed,
         report.close_count,
         report.win_count,
@@ -5064,6 +5325,18 @@ fn show_paper_quality(config: &AppConfig, limit: Option<usize>, since: Option<&s
         "\n{}",
         render_paper_quality_buckets("By abs target gap", &report.by_target_gap)
     );
+    println!(
+        "\n{}",
+        render_paper_quality_buckets("By abs fresh 1s move", &report.by_fresh_1s)
+    );
+    println!(
+        "\n{}",
+        render_paper_quality_buckets("By signal strength", &report.by_signal_strength)
+    );
+    println!(
+        "\n{}",
+        render_paper_quality_buckets("By aligned trade flow", &report.by_aligned_flow)
+    );
     println!("\n{}", render_paper_quality_table(&displayed_trades));
     Ok(())
 }
@@ -5076,13 +5349,16 @@ fn show_paper_run_summary(
 ) -> Result<()> {
     let journal = JournalStore::new(&config.storage)?;
     let since_filter = parse_since_filter(since)?;
+    let run_id = latest_paper_run_id(&journal, since_filter)?;
     let trades = filter_paper_trades_since(
         journal.load_paper_trades(limit_for_since_load(limit, since_filter))?,
         since_filter,
+        run_id.as_deref(),
     );
     let cycles = filter_paper_cycles_since(
         journal.load_paper_cycles(limit_for_since_load(limit, since_filter))?,
         since_filter,
+        run_id.as_deref(),
     );
     let post_trade = build_post_trade_report(&trades);
     let quality_trades = pair_paper_quality_trades(&trades, &cycles);
@@ -5120,7 +5396,7 @@ fn show_paper_run_summary(
 
     println!(
         "Paper run summary: range={} trade_events={} open={} close={} wins={} losses={} realized_profit={} win_rate_pct={} expectancy={} profit_factor={} max_drawdown={} avg_mfe={} avg_mae={}",
-        since_label(since_filter),
+        since_label(since_filter, run_id.as_deref()),
         trades.len(),
         post_trade.open_count,
         post_trade.close_count,
@@ -5151,7 +5427,7 @@ fn show_paper_run_summary(
         last_cycle,
     );
     println!(
-        "Paper run latency: trigger_samples={} avg_trigger_received_to_snapshot_ms={} p95_trigger_received_to_snapshot_ms={} avg_runtime_snapshot_ms={} p95_runtime_snapshot_ms={} avg_analysis_ms={} avg_selection_ms={} avg_revalidation_ms={} avg_execution_ms={} avg_cycle_total_ms={} p95_cycle_total_ms={}",
+        "Paper run latency: trigger_samples={} avg_trigger_received_to_snapshot_ms={} p95_trigger_received_to_snapshot_ms={} avg_runtime_snapshot_ms={} p95_runtime_snapshot_ms={} avg_analysis_ms={} avg_selection_ms={} avg_revalidation_ms={} avg_execution_ms={} avg_persistence_enqueue_ms={} avg_cycle_total_ms={} p95_cycle_total_ms={}",
         latency_report.trigger_received_to_snapshot_count,
         format_option_u64(latency_report.avg_trigger_received_to_snapshot_ms),
         format_option_u64(latency_report.p95_trigger_received_to_snapshot_ms),
@@ -5161,10 +5437,19 @@ fn show_paper_run_summary(
         format_option_u64(latency_report.avg_selection_ms),
         format_option_u64(latency_report.avg_revalidation_ms),
         format_option_u64(latency_report.avg_execution_ms),
+        format_option_u64(latency_report.avg_persistence_enqueue_ms),
         format_option_u64(latency_report.avg_cycle_total_ms),
         format_option_u64(latency_report.p95_cycle_total_ms),
     );
 
+    println!(
+        "\n{}",
+        render_count_table(
+            "Trigger sources",
+            &paper_trigger_source_counts(&cycles),
+            top,
+        )
+    );
     println!(
         "\n{}",
         render_count_table(
@@ -5220,6 +5505,7 @@ struct PaperLatencyReport {
     avg_selection_ms: Option<u64>,
     avg_revalidation_ms: Option<u64>,
     avg_execution_ms: Option<u64>,
+    avg_persistence_enqueue_ms: Option<u64>,
     avg_cycle_total_ms: Option<u64>,
     p95_cycle_total_ms: Option<u64>,
 }
@@ -5254,6 +5540,11 @@ fn build_paper_latency_report(cycles: &[PaperCycleEntry]) -> PaperLatencyReport 
         .map(|cycle| cycle.latency.execution_ms)
         .filter(|value| *value > 0)
         .collect::<Vec<_>>();
+    let persistence_enqueue = cycles
+        .iter()
+        .map(|cycle| cycle.latency.persistence_enqueue_ms)
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
     let cycle_total = cycles
         .iter()
         .map(|cycle| cycle.latency.cycle_total_ms)
@@ -5270,6 +5561,7 @@ fn build_paper_latency_report(cycles: &[PaperCycleEntry]) -> PaperLatencyReport 
         avg_selection_ms: average_u64(&selection),
         avg_revalidation_ms: average_u64(&revalidation),
         avg_execution_ms: average_u64(&execution),
+        avg_persistence_enqueue_ms: average_u64(&persistence_enqueue),
         avg_cycle_total_ms: average_u64(&cycle_total),
         p95_cycle_total_ms: percentile_u64(cycle_total, 95),
     }
@@ -5309,6 +5601,15 @@ fn paper_close_category_counts(trades: &[PaperTradeEntry]) -> BTreeMap<String, u
             .unwrap_or("unknown")
             .to_owned();
         *counts.entry(label).or_default() += 1;
+    }
+    counts
+}
+
+fn paper_trigger_source_counts(cycles: &[PaperCycleEntry]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for cycle in cycles {
+        let source = cycle.trigger_source.as_deref().unwrap_or("startup");
+        *counts.entry(source.to_owned()).or_default() += 1;
     }
     counts
 }
@@ -5733,6 +6034,9 @@ struct PaperQualityReport {
     by_entry_ask: BTreeMap<String, PaperQualityBucketStats>,
     by_seconds_left: BTreeMap<String, PaperQualityBucketStats>,
     by_target_gap: BTreeMap<String, PaperQualityBucketStats>,
+    by_fresh_1s: BTreeMap<String, PaperQualityBucketStats>,
+    by_signal_strength: BTreeMap<String, PaperQualityBucketStats>,
+    by_aligned_flow: BTreeMap<String, PaperQualityBucketStats>,
 }
 
 fn pair_paper_quality_trades(
@@ -5776,12 +6080,65 @@ fn latest_paper_open_for_close(
     close: &PaperTradeEntry,
 ) -> Option<PaperTradeEntry> {
     open_history.get(&close.slug).and_then(|opens| {
+        if !close.position_id.is_empty() {
+            let matching = opens
+                .iter()
+                .filter(|open| {
+                    open.recorded_at <= close.recorded_at && open.position_id == close.position_id
+                })
+                .collect::<Vec<_>>();
+            if !matching.is_empty() {
+                return aggregate_paper_position_opens(&matching);
+            }
+        }
+
         opens
             .iter()
             .rev()
             .find(|open| open.recorded_at <= close.recorded_at)
             .cloned()
     })
+}
+
+fn aggregate_paper_position_opens(opens: &[&PaperTradeEntry]) -> Option<PaperTradeEntry> {
+    let mut aggregate = (*opens.first()?).clone();
+    aggregate.recorded_at = opens
+        .iter()
+        .map(|open| open.recorded_at)
+        .min()
+        .unwrap_or(aggregate.recorded_at);
+    aggregate.spent_usdc = opens.iter().map(|open| open.spent_usdc).sum();
+    aggregate.expected_profit_usdc = Some(
+        opens
+            .iter()
+            .filter_map(|open| open.expected_profit_usdc)
+            .sum(),
+    );
+    aggregate.primary_outcome_ask_price =
+        weighted_paper_open_value(opens, |open| open.primary_outcome_ask_price);
+    aggregate.target_gap_bps = weighted_paper_open_value(opens, |open| open.target_gap_bps);
+    aggregate.note = format!(
+        "aggregated paper position opens={} | {}",
+        opens.len(),
+        aggregate.note
+    );
+    Some(aggregate)
+}
+
+fn weighted_paper_open_value(
+    opens: &[&PaperTradeEntry],
+    value: impl Fn(&PaperTradeEntry) -> Option<Decimal>,
+) -> Option<Decimal> {
+    let mut weighted_sum = Decimal::ZERO;
+    let mut total_weight = Decimal::ZERO;
+    for open in opens {
+        let Some(value) = value(open) else {
+            continue;
+        };
+        weighted_sum += value * open.spent_usdc;
+        total_weight += open.spent_usdc;
+    }
+    (total_weight > Decimal::ZERO).then(|| (weighted_sum / total_weight).round_dp(6))
 }
 
 fn paper_quality_mfe_mae_for_trade(
@@ -5832,6 +6189,9 @@ fn build_paper_quality_report(trades: &[PaperQualityTrade]) -> PaperQualityRepor
     let mut by_entry_ask = BTreeMap::<String, PaperQualityBucketStats>::new();
     let mut by_seconds_left = BTreeMap::<String, PaperQualityBucketStats>::new();
     let mut by_target_gap = BTreeMap::<String, PaperQualityBucketStats>::new();
+    let mut by_fresh_1s = BTreeMap::<String, PaperQualityBucketStats>::new();
+    let mut by_signal_strength = BTreeMap::<String, PaperQualityBucketStats>::new();
+    let mut by_aligned_flow = BTreeMap::<String, PaperQualityBucketStats>::new();
 
     for trade in trades {
         total.record(trade);
@@ -5845,6 +6205,18 @@ fn build_paper_quality_report(trades: &[PaperQualityTrade]) -> PaperQualityRepor
             .record(trade);
         by_target_gap
             .entry(paper_quality_target_gap_bucket(trade.open.target_gap_bps).to_owned())
+            .or_default()
+            .record(trade);
+        by_fresh_1s
+            .entry(paper_quality_fresh_1s_bucket(trade.open.spot_move_1s_bps).to_owned())
+            .or_default()
+            .record(trade);
+        by_signal_strength
+            .entry(paper_quality_signal_strength_bucket(trade.open.signal_strength_bps).to_owned())
+            .or_default()
+            .record(trade);
+        by_aligned_flow
+            .entry(paper_quality_aligned_flow_bucket(trade.open.aligned_trade_flow_bps).to_owned())
             .or_default()
             .record(trade);
     }
@@ -5861,6 +6233,9 @@ fn build_paper_quality_report(trades: &[PaperQualityTrade]) -> PaperQualityRepor
         by_entry_ask,
         by_seconds_left,
         by_target_gap,
+        by_fresh_1s,
+        by_signal_strength,
+        by_aligned_flow,
     }
 }
 
@@ -5895,6 +6270,36 @@ fn paper_quality_target_gap_bucket(value: Option<Decimal>) -> &'static str {
         Some(gap) if gap < Decimal::new(300, 2) => "gap 1.50-3.00",
         Some(gap) if gap < Decimal::new(600, 2) => "gap 3.00-6.00",
         Some(_) => "gap >= 6.00",
+    }
+}
+
+fn paper_quality_fresh_1s_bucket(value: Option<Decimal>) -> &'static str {
+    match value.map(|fresh| fresh.abs()) {
+        None => "unknown",
+        Some(fresh) if fresh < Decimal::ONE => "fresh < 1.00",
+        Some(fresh) if fresh < Decimal::from(5_u32) => "fresh 1.00-5.00",
+        Some(fresh) if fresh < Decimal::from(10_u32) => "fresh 5.00-10.00",
+        Some(_) => "fresh >= 10.00",
+    }
+}
+
+fn paper_quality_signal_strength_bucket(value: Option<Decimal>) -> &'static str {
+    match value {
+        None => "unknown",
+        Some(signal) if signal < Decimal::from(500_u32) => "signal < 500",
+        Some(signal) if signal < Decimal::from(1_500_u32) => "signal 500-1500",
+        Some(signal) if signal < Decimal::from(3_000_u32) => "signal 1500-3000",
+        Some(_) => "signal >= 3000",
+    }
+}
+
+fn paper_quality_aligned_flow_bucket(value: Option<Decimal>) -> &'static str {
+    match value {
+        None => "unknown",
+        Some(flow) if flow < Decimal::from(500_u32) => "flow < 500",
+        Some(flow) if flow < Decimal::from(2_000_u32) => "flow 500-2000",
+        Some(flow) if flow < Decimal::from(5_000_u32) => "flow 2000-5000",
+        Some(_) => "flow >= 5000",
     }
 }
 
@@ -6109,7 +6514,7 @@ fn build_post_trade_report(trades: &[PaperTradeEntry]) -> PostTradeReport {
 
 fn render_post_trade_report(report: &PostTradeReport) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "Post-trade :");
+    let _ = writeln!(output, "Post-trade report:");
     let _ = writeln!(
         output,
         "Open: {} | Close: {} | Win: {} | Loss: {} | WinRate: {}% | Expectancy: {} | ProfitFactor: {} | MaxDD: {} | Realized: {}",
@@ -6128,7 +6533,7 @@ fn render_post_trade_report(report: &PostTradeReport) -> String {
         return output;
     }
 
-    let _ = writeln!(output, "\\n :");
+    let _ = writeln!(output, "\nBy strategy:");
     let _ = writeln!(
         output,
         "{:<12} {:>6} {:>6} {:>6} {:>9} {:>9}",
@@ -6186,11 +6591,13 @@ fn show_paper_positions(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn settle_resolved_paper_positions(
     config: &AppConfig,
     journal: &JournalStore,
     binance_client: &BinanceClient,
     paper: &PaperExecutor,
+    run_id: &str,
     executed_market_slugs: &HashSet<String>,
     journal_snapshot: &mut PnlSnapshot,
     paper_journal: Option<&PaperJournalWriter>,
@@ -6236,9 +6643,18 @@ async fn settle_resolved_paper_positions(
     }
 
     let paper_state = paper.snapshot().await;
-    journal.update_snapshot_in_place(journal_snapshot, &paper_state, executed_market_slugs)?;
+    if let Some(writer) = paper_journal {
+        JournalStore::prepare_snapshot_update_in_place(
+            journal_snapshot,
+            &paper_state,
+            executed_market_slugs,
+        );
+        writer.record_snapshot(journal_snapshot.clone())?;
+    } else {
+        journal.update_snapshot_in_place(journal_snapshot, &paper_state, executed_market_slugs)?;
+    }
     for close_report in &close_reports {
-        let close_trade = build_paper_close_trade(close_report);
+        let close_trade = build_paper_close_trade(run_id, close_report);
         if let Some(writer) = paper_journal {
             writer.record_trade(close_trade)?;
         } else {
@@ -6246,7 +6662,6 @@ async fn settle_resolved_paper_positions(
         }
         log_paper_close(close_report, &paper_state);
     }
-    flush_paper_journal_if_needed(paper_journal)?;
 
     Ok(close_reports)
 }
@@ -6262,6 +6677,7 @@ async fn close_paper_positions_early(
     snapshot: &MarketSnapshot,
     exit_config: &EarlyExitConfig,
     paper_cost_model: PaperCostModel,
+    run_id: &str,
     executed_market_slugs: &HashSet<String>,
     journal_snapshot: &mut PnlSnapshot,
     paper_journal: Option<&PaperJournalWriter>,
@@ -6370,9 +6786,18 @@ async fn close_paper_positions_early(
     }
 
     let paper_state = paper.snapshot().await;
-    journal.update_snapshot_in_place(journal_snapshot, &paper_state, executed_market_slugs)?;
+    if let Some(writer) = paper_journal {
+        JournalStore::prepare_snapshot_update_in_place(
+            journal_snapshot,
+            &paper_state,
+            executed_market_slugs,
+        );
+        writer.record_snapshot(journal_snapshot.clone())?;
+    } else {
+        journal.update_snapshot_in_place(journal_snapshot, &paper_state, executed_market_slugs)?;
+    }
     for close_report in &close_reports {
-        let close_trade = build_paper_close_trade(close_report);
+        let close_trade = build_paper_close_trade(run_id, close_report);
         if let Some(writer) = paper_journal {
             writer.record_trade(close_trade)?;
         } else {
@@ -6380,16 +6805,8 @@ async fn close_paper_positions_early(
         }
         log_paper_close(close_report, &paper_state);
     }
-    flush_paper_journal_if_needed(paper_journal)?;
 
     Ok(close_reports)
-}
-
-fn flush_paper_journal_if_needed(paper_journal: Option<&PaperJournalWriter>) -> Result<()> {
-    if let Some(writer) = paper_journal {
-        writer.flush()?;
-    }
-    Ok(())
 }
 
 fn early_exit_reason(
@@ -7111,11 +7528,6 @@ fn summarize_worst_open_position(
 }
 
 fn paper_position_primary_side(position: &PaperPosition) -> PaperOutcomeSide {
-    let label_side = PaperOutcomeSide::from_label(&position.dominant_outcome_at_entry);
-    if label_side != PaperOutcomeSide::Unknown {
-        return label_side;
-    }
-
     position
         .legs
         .iter()
@@ -7125,7 +7537,10 @@ fn paper_position_primary_side(position: &PaperPosition) -> PaperOutcomeSide {
                 .partial_cmp(&right.shares)
                 .unwrap_or(Ordering::Equal)
         })
-        .map_or(PaperOutcomeSide::Unknown, |leg| leg.side)
+        .map_or_else(
+            || PaperOutcomeSide::from_label(&position.dominant_outcome_at_entry),
+            |leg| leg.side,
+        )
 }
 
 fn aligned_move_bps(move_bps: Decimal, side: PaperOutcomeSide) -> Decimal {
@@ -7136,8 +7551,15 @@ fn aligned_move_bps(move_bps: Decimal, side: PaperOutcomeSide) -> Decimal {
     }
 }
 
-fn build_paper_open_trade(opportunity: &Opportunity, report: &ExecutionReport) -> PaperTradeEntry {
+fn build_paper_open_trade(
+    run_id: &str,
+    position_id: &str,
+    opportunity: &Opportunity,
+    report: &ExecutionReport,
+) -> PaperTradeEntry {
     PaperTradeEntry {
+        run_id: run_id.to_owned(),
+        position_id: position_id.to_owned(),
         recorded_at: Utc::now(),
         action: PaperTradeAction::Open,
         slug: opportunity.slug.clone(),
@@ -7183,8 +7605,10 @@ fn build_paper_open_trade(opportunity: &Opportunity, report: &ExecutionReport) -
     }
 }
 
-fn build_paper_close_trade(report: &PaperCloseReport) -> PaperTradeEntry {
+fn build_paper_close_trade(run_id: &str, report: &PaperCloseReport) -> PaperTradeEntry {
     PaperTradeEntry {
+        run_id: run_id.to_owned(),
+        position_id: report.position_id.clone(),
         recorded_at: report.closed_at,
         action: PaperTradeAction::Close,
         slug: report.slug.clone(),
@@ -7350,6 +7774,7 @@ fn log_paper_cycle_summary(entry: &PaperCycleEntry) {
         near_miss = entry.near_miss_count,
         selected = entry.selected_count,
         executed = entry.executed_count,
+        trigger_source = entry.trigger_source.as_deref().unwrap_or("startup"),
         open_notional = %entry.open_notional,
         live_slug = entry.current_market_slug.as_deref().unwrap_or("-"),
         live_price = entry.current_market_price.as_deref().unwrap_or("-"),
@@ -7396,6 +7821,7 @@ fn log_paper_cycle_summary(entry: &PaperCycleEntry) {
         latency_selection_ms = entry.latency.selection_ms,
         latency_revalidation_ms = entry.latency.revalidation_ms,
         latency_execution_ms = entry.latency.execution_ms,
+        latency_persistence_enqueue_ms = entry.latency.persistence_enqueue_ms,
         latency_cycle_total_ms = entry.latency.cycle_total_ms,
         decision = entry.decision_reason.as_deref().unwrap_or("-"),
         "paper cycle summary"
@@ -7766,7 +8192,7 @@ fn log_auth_check(report: &AuthCheckReport) {
         signature_type = %report.signature_type,
         funder_mode = %report.funder_mode,
         funder_address = ?report.funder_address,
-        "live-"
+        "live auth check complete"
     );
 }
 
@@ -8440,7 +8866,7 @@ fn render_backtest_report(report: &BacktestReport, top: usize, title: &str) -> S
     let _ = writeln!(output, "{title}");
     let _ = writeln!(
         output,
-        "{} . | : {} | : {} | : {} | Near-miss: {} | Expected: {} | Realized: {}",
+        "{} entry minute(s) | Targets: {} | Windows: {} | Signals: {} | Near-miss: {} | Expected: {} | Realized: {}",
         report.entry_minutes,
         report.summaries.len(),
         total_sampled_windows,
@@ -8465,7 +8891,7 @@ fn render_backtest_report(report: &BacktestReport, top: usize, title: &str) -> S
         );
     }
     let _ = writeln!(output);
-    let _ = writeln!(output, ":");
+    let _ = writeln!(output, "Targets:");
     let _ = writeln!(
         output,
         "{:<10} {:>8} {:>8} {:>10} {:>10} {:>10} {:>9}",
@@ -9173,7 +9599,7 @@ fn log_runtime_trigger(trigger: Option<&RuntimeTriggerEvent>, config: &AppConfig
     } else {
         debug!(
             reactive_idle_secs = config.run.reactive_idle_secs,
-            ", fallback-"
+            "reactive trigger wait completed without an event; running fallback snapshot"
         );
     }
 }
@@ -9212,10 +9638,9 @@ async fn collect_reactive_market_snapshot(
 ) -> Result<MarketSnapshot> {
     let lookup_targets =
         runtime_market_targets_for_trigger(&config.strategy.market_targets, trigger);
-    let runtime_markets = fetch_current_live_markets(data_client, &lookup_targets).await?;
-    if config.run.polymarket_stream.enabled {
-        data_client.register_live_markets(&runtime_markets).await;
-    }
+    let runtime_markets = data_client
+        .cached_current_live_markets(&lookup_targets)
+        .await;
     let mut live_markets = filter_markets_for_runtime_trigger(runtime_markets, trigger);
     if should_use_live_only_polymarket_books(config) {
         let observed_ts = data_client.current_server_time_secs_fast().await;
@@ -9223,7 +9648,7 @@ async fn collect_reactive_market_snapshot(
     }
     let markets = merge_markets_by_slug(
         live_markets,
-        fetch_supported_markets_for_slugs(data_client, open_position_slugs).await?,
+        fetch_cached_supported_markets_for_slugs(data_client, open_position_slugs).await,
     );
     let reactive_cache = if reactive_component_cache_allowed(trigger) {
         Some(reactive_snapshot_cache)
@@ -9291,13 +9716,6 @@ fn filter_markets_for_runtime_trigger(
     }
 }
 
-async fn fetch_current_live_markets(
-    data_client: &MarketDataClient,
-    targets: &[MarketTarget],
-) -> Result<Vec<BinaryMarket>> {
-    data_client.fetch_cached_current_live_markets(targets).await
-}
-
 fn runtime_market_targets_for_trigger(
     configured_targets: &[MarketTarget],
     trigger: Option<&RuntimeTriggerEvent>,
@@ -9362,14 +9780,14 @@ async fn collect_exit_market_snapshot(
     open_position_slugs: &[String],
     reactive_snapshot_cache: &mut ReactiveMarketSnapshotCache,
 ) -> Result<MarketSnapshot> {
-    let markets = fetch_supported_markets_for_slugs(data_client, open_position_slugs).await?;
+    let markets = fetch_cached_supported_markets_for_slugs(data_client, open_position_slugs).await;
     collect_market_snapshot_for_markets_with_options(
         config,
         markets,
         data_client,
         binance_client,
         false,
-        true,
+        false,
         Some(reactive_snapshot_cache),
     )
     .await
@@ -9421,8 +9839,14 @@ async fn collect_market_snapshot_for_markets_cached(
     const REACTIVE_COMPONENT_TTL_MS: u128 = 500;
 
     let observed_ts = data_client.current_server_time_secs_fast().await;
-    let contexts =
-        fetch_binance_contexts_for_markets(config, &markets, binance_client, observed_ts).await?;
+    let contexts = fetch_binance_contexts_for_markets(
+        config,
+        &markets,
+        binance_client,
+        observed_ts,
+        config.run.reactive && should_use_live_only_polymarket_books(config),
+    )
+    .await?;
 
     let desired_slugs = markets
         .iter()
@@ -9509,14 +9933,21 @@ async fn fetch_binance_contexts_for_markets(
     markets: &[BinaryMarket],
     binance_client: &BinanceClient,
     observed_ts: i64,
+    live_only: bool,
 ) -> Result<HashMap<String, BtcFiveMinuteContext>> {
     let context_results = join_all(markets.iter().map(|market| async move {
         (
             market.slug.clone(),
             market.target(),
-            binance_client
-                .market_context_at_timestamp(market, observed_ts)
-                .await,
+            if live_only {
+                binance_client
+                    .market_context_at_timestamp_live_only(market, observed_ts)
+                    .await
+            } else {
+                binance_client
+                    .market_context_at_timestamp(market, observed_ts)
+                    .await
+            },
         )
     }))
     .await;
@@ -9538,7 +9969,7 @@ async fn fetch_binance_contexts_for_markets(
             Err(error) => return Err(error),
         }
     }
-    debug!(contexts = contexts.len(), "Binance");
+    debug!(contexts = contexts.len(), "loaded live exchange contexts");
     log_market_context_source_health(config, &contexts);
     Ok(contexts)
 }
@@ -9549,6 +9980,7 @@ fn log_market_context_source_health(
 ) {
     let mut binance_trade = 0_usize;
     let mut coinbase_ticker = 0_usize;
+    let mut coinbase_level2 = 0_usize;
     let mut chainlink_rtds = 0_usize;
     let mut binance_rest_latest = 0_usize;
     let mut binance_rest_1m_fallback = 0_usize;
@@ -9564,6 +9996,7 @@ fn log_market_context_source_health(
         match context.current_spot_source.as_str() {
             "Binance::Trade" => binance_trade += 1,
             "Coinbase::Ticker" => coinbase_ticker += 1,
+            "Coinbase::Level2" => coinbase_level2 += 1,
             "Chainlink::RTDS" => chainlink_rtds += 1,
             "Binance::RestLatest" => binance_rest_latest += 1,
             "Binance::Rest1mFallback" => binance_rest_1m_fallback += 1,
@@ -9588,6 +10021,7 @@ fn log_market_context_source_health(
             contexts = contexts.len(),
             binance_trade,
             coinbase_ticker,
+            coinbase_level2,
             chainlink_rtds,
             binance_rest_latest,
             binance_rest_1m_fallback,
@@ -9625,10 +10059,6 @@ async fn fetch_market_books_and_trade_flows(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-
-    if config.run.polymarket_stream.enabled {
-        data_client.register_live_markets(markets).await;
-    }
 
     let books = if config.run.polymarket_stream.enabled {
         data_client
@@ -9673,7 +10103,10 @@ async fn fetch_market_books_and_trade_flows(
     } else {
         HashMap::new()
     };
-    debug!(trade_flows = trade_flows.len(), "trade-flow Polymarket");
+    debug!(
+        trade_flows = trade_flows.len(),
+        "loaded Polymarket live trade-flow summaries"
+    );
 
     Ok((books, trade_flows))
 }
@@ -9702,7 +10135,7 @@ async fn fetch_fresh_market_snapshot_for_markets(
         .into_iter()
         .collect::<Vec<_>>();
 
-    if config.run.polymarket_stream.enabled {
+    if config.run.polymarket_stream.enabled && !should_use_live_only_polymarket_books(config) {
         data_client.register_live_markets(&markets).await;
     }
 
@@ -9722,35 +10155,14 @@ async fn fetch_fresh_market_snapshot_for_markets(
         "fresh market snapshot order books loaded"
     );
 
-    let context_results = join_all(markets.iter().map(|market| async move {
-        (
-            market.slug.clone(),
-            market.target(),
-            binance_client
-                .market_context_at_timestamp(market, observed_ts)
-                .await,
-        )
-    }))
-    .await;
-    let mut contexts = HashMap::<String, BtcFiveMinuteContext>::with_capacity(markets.len());
-    for (slug, target, context_result) in context_results {
-        match context_result {
-            Ok(Some(context)) => {
-                contexts.insert(slug, context);
-            }
-            Ok(None) => {}
-            Err(AppError::InvalidMarket(message)) if message.contains("Binance") => {
-                debug!(
-                    slug = %slug,
-                    target = ?target,
-                    reason = %message,
-                    "skipping market context after transient Binance data gap"
-                );
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    debug!(contexts = contexts.len(), "Binance");
+    let contexts = fetch_binance_contexts_for_markets(
+        config,
+        &markets,
+        binance_client,
+        observed_ts,
+        config.run.reactive && should_use_live_only_polymarket_books(config),
+    )
+    .await?;
 
     let trade_flows = if include_trade_flows {
         let trade_flow_windows = markets
@@ -9781,7 +10193,10 @@ async fn fetch_fresh_market_snapshot_for_markets(
     } else {
         HashMap::new()
     };
-    debug!(trade_flows = trade_flows.len(), "trade-flow Polymarket");
+    debug!(
+        trade_flows = trade_flows.len(),
+        "loaded Polymarket live trade-flow summaries"
+    );
 
     Ok(MarketSnapshot {
         markets,
@@ -9791,23 +10206,19 @@ async fn fetch_fresh_market_snapshot_for_markets(
     })
 }
 
-async fn fetch_supported_markets_for_slugs(
+async fn fetch_cached_supported_markets_for_slugs(
     data_client: &MarketDataClient,
     slugs: &[String],
-) -> Result<Vec<BinaryMarket>> {
-    let slug_results = join_all(
+) -> Vec<BinaryMarket> {
+    join_all(
         slugs
             .iter()
-            .map(|slug| async move { data_client.fetch_supported_market_by_slug(slug).await }),
+            .map(|slug| async move { data_client.cached_supported_market_by_slug(slug).await }),
     )
-    .await;
-    let mut markets = Vec::with_capacity(slugs.len());
-    for result in slug_results {
-        if let Some(market) = result? {
-            markets.push(market);
-        }
-    }
-    Ok(markets)
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn merge_markets_by_slug(
@@ -10823,7 +11234,7 @@ fn render_dashboard_screen_v2(
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        positions.sort_by(|left, right| right.opened_at.cmp(&left.opened_at));
+        positions.sort_by_key(|position| std::cmp::Reverse(position.opened_at));
         let _ = writeln!(output);
         let _ = writeln!(output, "Open positions:");
         if positions.is_empty() {
@@ -10840,7 +11251,7 @@ fn render_dashboard_screen_v2(
 
     if state.show_trades {
         let mut trades = recent_trades.to_vec();
-        trades.sort_by(|left, right| right.recorded_at.cmp(&left.recorded_at));
+        trades.sort_by_key(|trade| std::cmp::Reverse(trade.recorded_at));
         let _ = writeln!(output);
         let _ = writeln!(output, "Recent trades:");
         if trades.is_empty() {
@@ -11440,6 +11851,34 @@ mod tests {
         assert_eq!(near_miss_ask_bucket_label(None), "unknown");
     }
 
+    #[test]
+    fn paper_quality_signal_buckets_expose_continuation_quality() {
+        assert_eq!(
+            paper_quality_fresh_1s_bucket(Some(decimal("-0.55"))),
+            "fresh < 1.00"
+        );
+        assert_eq!(
+            paper_quality_fresh_1s_bucket(Some(decimal("14.08"))),
+            "fresh >= 10.00"
+        );
+        assert_eq!(
+            paper_quality_signal_strength_bucket(Some(decimal("50.50"))),
+            "signal < 500"
+        );
+        assert_eq!(
+            paper_quality_signal_strength_bucket(Some(decimal("4719.82"))),
+            "signal >= 3000"
+        );
+        assert_eq!(
+            paper_quality_aligned_flow_bucket(Some(decimal("41.99"))),
+            "flow < 500"
+        );
+        assert_eq!(
+            paper_quality_aligned_flow_bucket(Some(decimal("7811.63"))),
+            "flow >= 5000"
+        );
+    }
+
     fn test_v4_overlay() -> V4InventoryConfig {
         V4InventoryConfig {
             enabled: true,
@@ -11509,7 +11948,8 @@ mod tests {
     #[test]
     fn repeat_entry_throttle_blocks_same_market_side_until_interval() {
         let raw = include_str!("../../config.codex-scalp-v1-raw-light-v3.toml");
-        let config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
+        let mut config: AppConfig = toml::from_str(raw).expect("fixture config should parse");
+        config.run.repeat_entry_min_interval_ms = 500;
         let opportunity = test_opportunity("btc-updown-5m-throttle", "10", "Down");
         let mut throttle = HashMap::<String, Instant>::new();
         let first_entry_at = Instant::now();
@@ -11838,6 +12278,7 @@ mod tests {
             });
         }
         PaperPosition {
+            position_id: format!("position-{slug}"),
             opened_at: Utc::now(),
             scheduled_close_at: None,
             condition_id: format!("condition-{slug}"),
@@ -12141,6 +12582,41 @@ mod tests {
     }
 
     #[test]
+    fn scalp_exit_reason_uses_bought_leg_for_counter_bias_time_stop() {
+        let slug = "btc-updown-5m-scalp-counter-bias-time";
+        let mut position = test_position(slug, "10", "0");
+        position.kind = OpportunityKind::CodexScalpProbeV1;
+        position.dominant_outcome_at_entry = "Down".to_owned();
+        position.opened_at = Utc::now() - chrono::Duration::seconds(21);
+
+        let mut books = HashMap::new();
+        books.insert(
+            format!("{slug}-up"),
+            test_book(&format!("{slug}-up"), "0.51", "10"),
+        );
+
+        let mut exit_config = EarlyExitConfig::default();
+        exit_config.scalp_exit_enabled = true;
+        exit_config.scalp_take_profit_price_delta = decimal("0.08");
+        exit_config.scalp_stop_loss_price_delta = Decimal::ZERO;
+        exit_config.scalp_time_stop_secs = 20;
+        exit_config.max_loss_usdc = Decimal::ZERO;
+        exit_config.min_hold_secs = 1;
+
+        assert_eq!(paper_position_primary_side(&position), PaperOutcomeSide::Up);
+        let reason = early_exit_reason(
+            &position,
+            &test_context(),
+            &books,
+            &exit_config,
+            PaperCostModel::new(0, 0),
+        )
+        .expect("counter-bias scalp should time-stop the bought leg");
+
+        assert!(reason.starts_with("early-exit scalp time-stop"));
+    }
+
+    #[test]
     fn scalp_exit_reason_closes_before_settlement_window() {
         let slug = "btc-updown-5m-scalp-near-expiry";
         let mut position = test_position(slug, "10", "0");
@@ -12299,12 +12775,14 @@ mod tests {
         let mut tracker = V4InventoryTracker::default();
         let slug = "btc-updown-5m-cooldown";
         let reports = vec![PaperCloseReport {
+            position_id: "position-cooldown".to_owned(),
             closed_at: Utc::now(),
             slug: slug.to_owned(),
             condition_id: "condition".to_owned(),
             question: "Test".to_owned(),
             kind: OpportunityKind::BonereaperStateV2,
             dominant_outcome_at_entry: "Up".to_owned(),
+            primary_outcome_at_entry: "Up".to_owned(),
             actual_outcome: WindowDirection::Flat,
             realized_payout_usdc: decimal("4"),
             realized_profit_usdc: decimal("-1"),

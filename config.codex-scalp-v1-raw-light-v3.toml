@@ -134,7 +134,7 @@ reactive = true
 reactive_debounce_ms = 0
 reactive_idle_secs = 0
 allow_repeat_entries_same_window = true
-repeat_entry_min_interval_ms = 500
+repeat_entry_min_interval_ms = 0
 revalidate_before_execute = false
 execute_top_n = 3
 

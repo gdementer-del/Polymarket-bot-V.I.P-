@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::MarketTarget;
 
-use super::binance::BinanceClient;
+use super::binance::{BinanceClient, clamp_live_event_time_ms};
 
 const STREAM_RECONNECT_DELAY_MS: u64 = 300;
 type CoinbaseL2Level = (Decimal, Decimal);
@@ -292,6 +292,14 @@ impl CoinbaseClient {
             warn!("Coinbase latest_tickers mutex is poisoned; skipping price monitor update");
             return;
         };
+        let received_time_ms = Utc::now().timestamp_millis();
+        let event_time_ms = clamp_live_event_time_ms(event_time_ms, received_time_ms);
+        if tickers
+            .get(product_id)
+            .is_some_and(|ticker| ticker.event_time_ms >= event_time_ms)
+        {
+            return;
+        }
         tickers.insert(
             product_id.to_owned(),
             CoinbaseTickerPrice {
@@ -299,7 +307,7 @@ impl CoinbaseClient {
                 symbol: binance_symbol.to_owned(),
                 price,
                 event_time_ms,
-                received_time_ms: Utc::now().timestamp_millis(),
+                received_time_ms,
             },
         );
     }
@@ -539,11 +547,14 @@ fn install_rustls_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use rust_decimal::Decimal;
 
     use super::{
-        CoinbaseL2Book, CoinbaseL2SnapshotMessage, CoinbaseL2UpdateMessage, CoinbaseTickerMessage,
+        CoinbaseClient, CoinbaseL2Book, CoinbaseL2SnapshotMessage, CoinbaseL2UpdateMessage,
+        CoinbaseTickerMessage,
     };
+    use crate::services::binance::BinanceClient;
 
     #[test]
     fn selected_price_prefers_tight_bid_ask_mid() {
@@ -573,6 +584,68 @@ mod tests {
         };
 
         assert!(ticker.selected_price(Decimal::new(5, 0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn raw_ticker_view_does_not_report_future_event_age() {
+        let binance_client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("binance client");
+        let client = CoinbaseClient::new(
+            "wss://example.invalid".to_owned(),
+            binance_client,
+            Decimal::from(25_u32),
+            Decimal::from(25_u32),
+        );
+        client.store_latest_ticker(
+            "BTC-USD",
+            "BTCUSDT",
+            Utc::now().timestamp_millis().saturating_add(10_000),
+            Decimal::new(10_000, 2),
+        );
+
+        let views = client.latest_ticker_price_views();
+
+        assert_eq!(views.len(), 1);
+        assert!(views[0].event_age_ms >= 0);
+        assert!(views[0].received_age_ms >= 0);
+    }
+
+    #[test]
+    fn delayed_raw_ticker_does_not_replace_newer_monitor_price() {
+        let binance_client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("binance client");
+        let client = CoinbaseClient::new(
+            "wss://example.invalid".to_owned(),
+            binance_client,
+            Decimal::from(25_u32),
+            Decimal::from(25_u32),
+        );
+        let now_ms = Utc::now().timestamp_millis();
+        client.store_latest_ticker(
+            "BTC-USD",
+            "BTCUSDT",
+            now_ms.saturating_sub(100),
+            Decimal::new(10_100, 2),
+        );
+        client.store_latest_ticker(
+            "BTC-USD",
+            "BTCUSDT",
+            now_ms.saturating_sub(1_000),
+            Decimal::new(9_900, 2),
+        );
+
+        let views = client.latest_ticker_price_views();
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].price, Decimal::new(10_100, 2));
     }
 
     #[test]

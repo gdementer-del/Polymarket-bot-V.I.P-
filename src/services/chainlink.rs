@@ -400,8 +400,11 @@ impl ChainlinkOracleCache {
         let Some(price) = valid_chainlink_price(&symbol, &payload.value)? else {
             return Ok(());
         };
-        let event_time_ms = payload.timestamp.unwrap_or(message.timestamp);
         let received_time_ms = Utc::now().timestamp_millis();
+        let event_time_ms = clamp_chainlink_event_time_ms(
+            payload.timestamp.unwrap_or(message.timestamp),
+            received_time_ms,
+        );
         let quote = ChainlinkOracleQuote {
             event_time_ms,
             received_time_ms,
@@ -425,7 +428,7 @@ impl ChainlinkOracleCache {
                 continue;
             };
             let quote = ChainlinkOracleQuote {
-                event_time_ms: point.timestamp,
+                event_time_ms: clamp_chainlink_event_time_ms(point.timestamp, received_time_ms),
                 received_time_ms,
                 price,
             };
@@ -451,7 +454,7 @@ impl ChainlinkOracleCache {
             .quotes_by_symbol
             .entry(symbol.clone())
             .or_insert_with(VecDeque::new);
-        quotes.push_back(quote);
+        insert_chainlink_quote_ordered(quotes, quote);
         prune_quote_history(quotes, quote.event_time_ms);
 
         for target in SUPPORTED_TARGETS {
@@ -523,7 +526,14 @@ impl ChainlinkOracleCache {
             .get(&normalize_chainlink_symbol(symbol))?
             .back()
             .copied()
-            .filter(|quote| now_ms.saturating_sub(quote.received_time_ms) <= max_quote_age_ms)
+            .filter(|quote| {
+                let event_age_ms = now_ms.saturating_sub(quote.event_time_ms);
+                let received_age_ms = now_ms.saturating_sub(quote.received_time_ms);
+                event_age_ms >= 0
+                    && event_age_ms <= max_quote_age_ms
+                    && received_age_ms >= 0
+                    && received_age_ms <= max_quote_age_ms
+            })
     }
 
     async fn window_open_quote(
@@ -664,8 +674,36 @@ fn cache_window_quote(
     }
 }
 
+fn insert_chainlink_quote_ordered(
+    quotes: &mut VecDeque<ChainlinkOracleQuote>,
+    quote: ChainlinkOracleQuote,
+) {
+    if let Some(existing_index) = quotes
+        .iter()
+        .position(|existing| existing.event_time_ms == quote.event_time_ms)
+    {
+        let existing = quotes
+            .get_mut(existing_index)
+            .expect("index came from the same quote deque");
+        if existing.price != quote.price {
+            existing.price = quote.price;
+        }
+        return;
+    }
+
+    let insert_at = quotes
+        .iter()
+        .position(|existing| existing.event_time_ms > quote.event_time_ms)
+        .unwrap_or(quotes.len());
+    quotes.insert(insert_at, quote);
+}
+
 fn prune_quote_history(quotes: &mut VecDeque<ChainlinkOracleQuote>, latest_event_time_ms: i64) {
-    let keep_from_ms = latest_event_time_ms.saturating_sub(QUOTE_HISTORY_RETENTION_MS);
+    let newest_event_time_ms = quotes
+        .back()
+        .map_or(latest_event_time_ms, |quote| quote.event_time_ms)
+        .max(latest_event_time_ms);
+    let keep_from_ms = newest_event_time_ms.saturating_sub(QUOTE_HISTORY_RETENTION_MS);
     while quotes
         .front()
         .is_some_and(|quote| quote.event_time_ms < keep_from_ms)
@@ -681,6 +719,14 @@ fn prune_window_cache(windows: &mut HashMap<String, ChainlinkWindowCache>) {
         if windows.len() > WINDOW_CACHE_MAX_ENTRIES {
             windows.clear();
         }
+    }
+}
+
+const fn clamp_chainlink_event_time_ms(event_time_ms: i64, received_time_ms: i64) -> i64 {
+    if event_time_ms < received_time_ms {
+        event_time_ms
+    } else {
+        received_time_ms
     }
 }
 
@@ -782,7 +828,7 @@ mod tests {
     fn test_settings() -> ChainlinkOracleConfig {
         ChainlinkOracleConfig {
             enabled: true,
-            max_quote_age_ms: 60_000,
+            max_quote_age_ms: i64::MAX,
             max_window_open_lag_ms: 3_000,
             max_settlement_close_lag_ms: 5_000,
         }
@@ -875,6 +921,39 @@ mod tests {
         assert_eq!(context.current_spot_price, decimal("101.2"));
         assert_eq!(context.current_spot_source, "Binance::Trade");
         assert_eq!(context.current_spot_quote_points, Some(1));
+    }
+
+    #[tokio::test]
+    async fn out_of_order_chainlink_quote_does_not_replace_latest_price() {
+        let cache = ChainlinkOracleCache::default();
+        cache.set_test_settings(test_settings()).await;
+        cache
+            .ingest_test_quote("btc/usd", 902_000, decimal("102"))
+            .await;
+        cache
+            .ingest_test_quote("btc/usd", 901_000, decimal("101"))
+            .await;
+
+        let views = cache.latest_price_views(&[MarketTarget::Btc5m]).await;
+
+        assert_eq!(
+            views[0].quote.map(|quote| quote.price),
+            Some(decimal("102"))
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_chainlink_quote_does_not_become_fresh_on_receive() {
+        let cache = ChainlinkOracleCache::default();
+        let mut settings = test_settings();
+        settings.max_quote_age_ms = 100;
+        cache.set_test_settings(settings).await;
+        cache
+            .ingest_test_quote("btc/usd", 901_000, decimal("101"))
+            .await;
+        let mut context = test_context();
+
+        assert!(!cache.decorate_context(&test_market(), &mut context).await);
     }
 
     #[tokio::test]

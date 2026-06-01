@@ -121,6 +121,7 @@ struct LiveSpotQuote {
 enum SpotQuoteSource {
     BinanceTrade,
     CoinbaseTicker,
+    CoinbaseLevel2,
 }
 
 impl SpotQuoteSource {
@@ -128,11 +129,12 @@ impl SpotQuoteSource {
         match self {
             Self::BinanceTrade => "Binance::Trade",
             Self::CoinbaseTicker => "Coinbase::Ticker",
+            Self::CoinbaseLevel2 => "Coinbase::Level2",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct LiveSecondKline {
     open_time_ms: i64,
     close_time_ms: i64,
@@ -147,6 +149,7 @@ struct LiveBookLevel {
 
 #[derive(Debug, Clone)]
 struct LiveBookDepthSnapshot {
+    event_time_ms: i64,
     received_time_ms: i64,
     bids: Vec<LiveBookLevel>,
     asks: Vec<LiveBookLevel>,
@@ -409,7 +412,8 @@ impl BinanceClient {
             .map(|symbol| {
                 let normalized_symbol = normalize_symbol(symbol);
                 let quotes = quote_cache.get(&normalized_symbol);
-                let latest_quote = quotes.and_then(|quotes| quotes.back()).copied();
+                let latest_quote = quotes
+                    .and_then(|quotes| freshest_quote(quotes, now_ms, MAX_CACHED_QUOTE_AGE_MS));
                 let depth_snapshot = book_depth_cache.get(&normalized_symbol);
 
                 LiveMarketDataHealth {
@@ -531,6 +535,50 @@ impl BinanceClient {
         market: &BinaryMarket,
         observed_ts: i64,
     ) -> Result<Option<MarketWindowContext>> {
+        self.market_context_at_timestamp_with_options(market, observed_ts, true)
+            .await
+    }
+
+    /// Build the current exchange context without any REST fallback.
+    ///
+    /// Reactive paper decisions use this after startup prewarm so a transient
+    /// stream gap skips one snapshot instead of blocking the hot path on HTTP.
+    pub async fn market_context_at_timestamp_live_only(
+        &self,
+        market: &BinaryMarket,
+        observed_ts: i64,
+    ) -> Result<Option<MarketWindowContext>> {
+        self.market_context_at_timestamp_with_options(market, observed_ts, false)
+            .await
+    }
+
+    /// Cache the interval-open price required by the live-only context builder.
+    ///
+    /// This is intentionally called from startup/background tasks rather than
+    /// from the reactive decision path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Binance interval-open request fails.
+    pub async fn prewarm_market_interval_open(&self, market: &BinaryMarket) -> Result<bool> {
+        let Some(target) = market.target() else {
+            return Ok(false);
+        };
+        let Some(start_ts) = market.window_start_ts() else {
+            return Ok(false);
+        };
+        let end_ts = start_ts.saturating_add(target.window_secs());
+        self.interval_open_price_cached(target.binance_symbol(), start_ts, end_ts)
+            .await?;
+        Ok(true)
+    }
+
+    async fn market_context_at_timestamp_with_options(
+        &self,
+        market: &BinaryMarket,
+        observed_ts: i64,
+        allow_rest_fallback: bool,
+    ) -> Result<Option<MarketWindowContext>> {
         let Some(target) = market.target() else {
             return Ok(None);
         };
@@ -539,7 +587,7 @@ impl BinanceClient {
         };
 
         let Some(mut context) = self
-            .window_context_at(target, start_ts, observed_ts)
+            .window_context_at(target, start_ts, observed_ts, allow_rest_fallback)
             .await?
         else {
             return Ok(None);
@@ -582,7 +630,7 @@ impl BinanceClient {
             return Ok(None);
         };
 
-        self.window_context_at(target, start_ts, start_ts + elapsed_secs.max(0))
+        self.window_context_at(target, start_ts, start_ts + elapsed_secs.max(0), true)
             .await
     }
 
@@ -700,7 +748,8 @@ impl BinanceClient {
             return Ok(None);
         };
 
-        self.window_context_at(target, start_ts, observed_ts).await
+        self.window_context_at(target, start_ts, observed_ts, true)
+            .await
     }
 
     /// Build the Binance spot context for a BTC 5-minute market.
@@ -923,6 +972,7 @@ impl BinanceClient {
         target: MarketTarget,
         start_ts: i64,
         quote_ts: i64,
+        allow_rest_fallback: bool,
     ) -> Result<Option<MarketWindowContext>> {
         let window_secs = target.window_secs();
         let end_ts = start_ts + window_secs;
@@ -931,18 +981,35 @@ impl BinanceClient {
         }
 
         let symbol = target.binance_symbol();
-        let interval_open_price = self
-            .interval_open_price_cached(symbol, start_ts, end_ts)
-            .await?;
+        let interval_open_price = if allow_rest_fallback {
+            self.interval_open_price_cached(symbol, start_ts, end_ts)
+                .await?
+        } else {
+            let Some(price) = self
+                .cached_interval_open_price_from_stream(symbol, start_ts)
+                .await
+            else {
+                return Ok(None);
+            };
+            price
+        };
         let now_ts = Utc::now().timestamp();
         let live_snapshot = if should_use_live_snapshot(start_ts, end_ts, quote_ts, now_ts) {
-            Some(self.live_price_snapshot(symbol).await?)
+            if allow_rest_fallback {
+                Some(self.live_price_snapshot(symbol).await?)
+            } else {
+                self.live_signal_state_from_streams(symbol, Utc::now().timestamp_millis())
+                    .await
+            }
         } else {
             None
         };
         let current_spot_price = match live_snapshot {
             Some(snapshot) => snapshot.current_spot_price,
-            None => self.one_minute_close_at(symbol, start_ts, quote_ts).await?,
+            None if allow_rest_fallback => {
+                self.one_minute_close_at(symbol, start_ts, quote_ts).await?
+            }
+            None => return Ok(None),
         };
         let now_ms = Utc::now().timestamp_millis();
         let current_spot_source = live_snapshot.map_or_else(
@@ -1293,23 +1360,24 @@ impl BinanceClient {
         let price = parse_decimal("binance.trade.price", &trade.price)?;
         let normalized_symbol = normalize_symbol(symbol);
         let received_time_ms = Utc::now().timestamp_millis();
+        let event_time_ms = clamp_live_event_time_ms(trade.event_time_ms, received_time_ms);
         let mut cache = self.quote_cache.write().await;
         let quotes = cache
             .entry(normalized_symbol.clone())
             .or_insert_with(VecDeque::new);
         quotes.push_back(LiveSpotQuote {
-            event_time_ms: trade.event_time_ms,
+            event_time_ms,
             received_time_ms,
             price,
             source: SpotQuoteSource::BinanceTrade,
         });
-        prune_quote_history(quotes, trade.event_time_ms);
+        prune_quote_history(quotes, event_time_ms);
         drop(cache);
         self.refresh_live_signal_state(&normalized_symbol, received_time_ms)
             .await;
         let _ = self.trigger_tx.send(Some(BinanceTriggerEvent {
             symbol: normalized_symbol,
-            event_time_ms: trade.event_time_ms,
+            event_time_ms,
             received_time_ms,
             price,
             source: BinanceTriggerSource::Trade,
@@ -1328,6 +1396,7 @@ impl BinanceClient {
         let normalized_symbol = normalize_symbol(symbol);
         let received_time_ms = Utc::now().timestamp_millis();
         let snapshot = LiveBookDepthSnapshot {
+            event_time_ms: received_time_ms,
             received_time_ms,
             bids,
             asks,
@@ -1380,6 +1449,7 @@ impl BinanceClient {
 
         let normalized_symbol = normalize_symbol(symbol);
         let received_time_ms = Utc::now().timestamp_millis();
+        let event_time_ms = clamp_live_event_time_ms(event_time_ms, received_time_ms);
         {
             let mut cache = self.quote_cache.write().await;
             let quotes = cache
@@ -1395,6 +1465,11 @@ impl BinanceClient {
                 return Ok(false);
             };
             if event_time_ms <= primary_quote.event_time_ms {
+                return Ok(false);
+            }
+            if freshest_quote(quotes, received_time_ms, MAX_CACHED_QUOTE_AGE_MS)
+                .is_some_and(|quote| quote.event_time_ms >= event_time_ms)
+            {
                 return Ok(false);
             }
 
@@ -1471,6 +1546,7 @@ impl BinanceClient {
 
         let normalized_symbol = normalize_symbol(symbol);
         let received_time_ms = Utc::now().timestamp_millis();
+        let event_time_ms = clamp_live_event_time_ms(event_time_ms, received_time_ms);
         {
             let quote_cache = self.quote_cache.read().await;
             let Some(quotes) = quote_cache.get(&normalized_symbol) else {
@@ -1503,14 +1579,34 @@ impl BinanceClient {
 
         {
             let mut depth_cache = self.book_depth_cache.write().await;
+            if depth_cache
+                .get(&normalized_symbol)
+                .is_some_and(|snapshot| snapshot.event_time_ms > event_time_ms)
+            {
+                return Ok(false);
+            }
             depth_cache.insert(
                 normalized_symbol.clone(),
                 LiveBookDepthSnapshot {
+                    event_time_ms,
                     received_time_ms,
                     bids,
                     asks,
                 },
             );
+        }
+        {
+            let mut quote_cache = self.quote_cache.write().await;
+            let quotes = quote_cache
+                .entry(normalized_symbol.clone())
+                .or_insert_with(VecDeque::new);
+            quotes.push_back(LiveSpotQuote {
+                event_time_ms,
+                received_time_ms,
+                price: mid,
+                source: SpotQuoteSource::CoinbaseLevel2,
+            });
+            prune_quote_history(quotes, event_time_ms);
         }
 
         self.refresh_live_signal_state(&normalized_symbol, received_time_ms)
@@ -1530,6 +1626,7 @@ impl BinanceClient {
         let open = parse_decimal("binance.kline_1s.open", &event.kline.open)?;
         let normalized_symbol = normalize_symbol(symbol);
         let received_time_ms = Utc::now().timestamp_millis();
+        let close_time_ms = clamp_live_event_time_ms(event.kline.close_time_ms, received_time_ms);
         self.cache_interval_open_from_second_kline(
             &normalized_symbol,
             event.kline.open_time_ms,
@@ -1538,7 +1635,7 @@ impl BinanceClient {
         .await;
         let trigger_event = BinanceTriggerEvent {
             symbol: normalized_symbol.clone(),
-            event_time_ms: event.kline.close_time_ms,
+            event_time_ms: close_time_ms,
             received_time_ms,
             price: open,
             source: BinanceTriggerSource::OneSecondKline,
@@ -1548,27 +1645,19 @@ impl BinanceClient {
         let klines = cache
             .entry(normalized_symbol.clone())
             .or_insert_with(VecDeque::new);
-
-        if let Some(last) = klines.back_mut()
-            && last.open_time_ms == event.kline.open_time_ms
-        {
-            last.close_time_ms = event.kline.close_time_ms;
-            last.open = open;
-            prune_second_kline_history(klines, event.kline.close_time_ms);
-            drop(cache);
-            self.refresh_live_signal_state(&normalized_symbol, received_time_ms)
-                .await;
-            let _ = self.trigger_tx.send(Some(trigger_event));
+        let changed = upsert_second_kline_ordered(
+            klines,
+            LiveSecondKline {
+                open_time_ms: event.kline.open_time_ms,
+                close_time_ms,
+                open,
+            },
+        );
+        prune_second_kline_history(klines, close_time_ms);
+        drop(cache);
+        if !changed {
             return Ok(());
         }
-
-        klines.push_back(LiveSecondKline {
-            open_time_ms: event.kline.open_time_ms,
-            close_time_ms: event.kline.close_time_ms,
-            open,
-        });
-        prune_second_kline_history(klines, event.kline.close_time_ms);
-        drop(cache);
         self.refresh_live_signal_state(&normalized_symbol, received_time_ms)
             .await;
         let _ = self.trigger_tx.send(Some(trigger_event));
@@ -1791,9 +1880,7 @@ impl BinanceClient {
         let Some(quotes) = cache.get(symbol) else {
             return LiveQuoteReferenceSnapshot::default();
         };
-        let latest_quote = quotes.back().copied().filter(|latest_quote| {
-            now_ms.saturating_sub(latest_quote.received_time_ms) <= MAX_CACHED_QUOTE_AGE_MS
-        });
+        let latest_quote = freshest_quote(quotes, now_ms, MAX_CACHED_QUOTE_AGE_MS);
         let micro_reference_price = latest_quote.and_then(|latest_quote| {
             reference_quote_for_window(quotes, latest_quote.event_time_ms, MICRO_PRICE_WINDOW_MS)
                 .map(|reference_quote| reference_quote.price)
@@ -2343,23 +2430,56 @@ fn build_live_price_snapshot(
 }
 
 fn prune_quote_history(quotes: &mut VecDeque<LiveSpotQuote>, latest_event_time_ms: i64) {
-    let keep_from_ms = latest_event_time_ms.saturating_sub(QUOTE_HISTORY_RETENTION_MS);
-    while quotes
-        .front()
-        .is_some_and(|quote| quote.event_time_ms < keep_from_ms)
-    {
-        let _dropped = quotes.pop_front();
+    let newest_event_time_ms = quotes
+        .iter()
+        .map(|quote| quote.event_time_ms)
+        .max()
+        .unwrap_or(latest_event_time_ms)
+        .max(latest_event_time_ms);
+    let keep_from_ms = newest_event_time_ms.saturating_sub(QUOTE_HISTORY_RETENTION_MS);
+    quotes.retain(|quote| quote.event_time_ms >= keep_from_ms);
+}
+
+pub(super) const fn clamp_live_event_time_ms(event_time_ms: i64, received_time_ms: i64) -> i64 {
+    if event_time_ms < received_time_ms {
+        event_time_ms
+    } else {
+        received_time_ms
     }
 }
 
 fn prune_second_kline_history(klines: &mut VecDeque<LiveSecondKline>, latest_close_time_ms: i64) {
-    let keep_from_ms = latest_close_time_ms.saturating_sub(QUOTE_HISTORY_RETENTION_MS);
-    while klines
-        .front()
-        .is_some_and(|kline| kline.close_time_ms < keep_from_ms)
+    let newest_close_time_ms = klines
+        .iter()
+        .map(|kline| kline.close_time_ms)
+        .max()
+        .unwrap_or(latest_close_time_ms)
+        .max(latest_close_time_ms);
+    let keep_from_ms = newest_close_time_ms.saturating_sub(QUOTE_HISTORY_RETENTION_MS);
+    klines.retain(|kline| kline.close_time_ms >= keep_from_ms);
+}
+
+fn upsert_second_kline_ordered(
+    klines: &mut VecDeque<LiveSecondKline>,
+    kline: LiveSecondKline,
+) -> bool {
+    if let Some(existing) = klines
+        .iter_mut()
+        .find(|existing| existing.open_time_ms == kline.open_time_ms)
     {
-        let _dropped = klines.pop_front();
+        if existing.close_time_ms >= kline.close_time_ms {
+            return false;
+        }
+        *existing = kline;
+        return true;
     }
+
+    let insert_at = klines
+        .iter()
+        .position(|existing| existing.open_time_ms > kline.open_time_ms)
+        .unwrap_or(klines.len());
+    klines.insert(insert_at, kline);
+    true
 }
 
 fn interval_open_cache_entry_from_second_kline(
@@ -2424,22 +2544,20 @@ fn reference_quote_for_window(
     latest_event_time_ms: i64,
     window_ms: i64,
 ) -> Option<LiveSpotQuote> {
-    let first_quote = quotes.front().copied()?;
+    let first_quote = quotes
+        .iter()
+        .copied()
+        .min_by_key(live_quote_freshness_key)?;
     let target_ms = latest_event_time_ms.saturating_sub(window_ms);
     if latest_event_time_ms.saturating_sub(first_quote.event_time_ms) < window_ms {
         return None;
     }
 
-    let mut selected = first_quote;
-    for quote in quotes {
-        if quote.event_time_ms <= target_ms {
-            selected = *quote;
-        } else {
-            break;
-        }
-    }
-
-    Some(selected)
+    quotes
+        .iter()
+        .copied()
+        .filter(|quote| quote.event_time_ms <= target_ms)
+        .max_by_key(live_quote_freshness_key)
 }
 
 fn latest_fresh_quote_from_source(
@@ -2448,9 +2566,37 @@ fn latest_fresh_quote_from_source(
     now_ms: i64,
     max_age_ms: i64,
 ) -> Option<LiveSpotQuote> {
-    quotes.iter().rev().copied().find(|quote| {
-        quote.source == source && now_ms.saturating_sub(quote.received_time_ms) <= max_age_ms
-    })
+    quotes
+        .iter()
+        .copied()
+        .filter(|quote| {
+            quote.source == source && now_ms.saturating_sub(quote.received_time_ms) <= max_age_ms
+        })
+        .max_by_key(live_quote_freshness_key)
+}
+
+fn freshest_quote(
+    quotes: &VecDeque<LiveSpotQuote>,
+    now_ms: i64,
+    max_age_ms: i64,
+) -> Option<LiveSpotQuote> {
+    quotes
+        .iter()
+        .copied()
+        .filter(|quote| now_ms.saturating_sub(quote.received_time_ms) <= max_age_ms)
+        .max_by_key(live_quote_freshness_key)
+}
+
+const fn live_quote_freshness_key(quote: &LiveSpotQuote) -> (i64, u8, i64) {
+    (
+        quote.event_time_ms,
+        match quote.source {
+            SpotQuoteSource::BinanceTrade => 2,
+            SpotQuoteSource::CoinbaseTicker => 1,
+            SpotQuoteSource::CoinbaseLevel2 => 0,
+        },
+        quote.received_time_ms,
+    )
 }
 
 const fn live_spot_price_point(quote: LiveSpotQuote, now_ms: i64) -> LiveSpotPricePoint {
@@ -2566,12 +2712,12 @@ mod tests {
 
     use super::{
         BinanceClient, BinanceTriggerSource, LiveBookDepthSnapshot, LiveBookLevel, LiveSecondKline,
-        LiveSpotQuote, MarketTarget, OneMinuteKline, SpotQuoteSource, combined_stream_url,
-        exchange_book_pressure, historical_micro_price_snapshot, historical_move_bps,
-        interval_open_cache_entry_from_second_kline, micro_reference_quote,
+        LiveSpotQuote, MarketTarget, OneMinuteKline, SpotQuoteSource, clamp_live_event_time_ms,
+        combined_stream_url, exchange_book_pressure, historical_micro_price_snapshot,
+        historical_move_bps, interval_open_cache_entry_from_second_kline, micro_reference_quote,
         parse_btc_5m_window_start_ts, parse_depth_levels, parse_window_start_ts,
         prune_quote_history, prune_second_kline_history, reference_kline_open_price,
-        should_use_live_snapshot,
+        reference_quote_for_window, should_use_live_snapshot, upsert_second_kline_ordered,
     };
 
     const fn test_quote(event_time_ms: i64, price: Decimal) -> LiveSpotQuote {
@@ -2621,6 +2767,20 @@ mod tests {
     }
 
     #[test]
+    fn reference_quote_handles_out_of_order_multi_source_arrivals() {
+        let quotes = VecDeque::from([
+            test_quote(1_000, Decimal::new(10_000, 2)),
+            test_quote(4_500, Decimal::new(10_100, 2)),
+            test_quote(4_000, Decimal::new(10_200, 2)),
+            test_quote(9_500, Decimal::new(10_300, 2)),
+        ]);
+
+        let reference = reference_quote_for_window(&quotes, 9_500, 5_000).expect("reference quote");
+        assert_eq!(reference.event_time_ms, 4_500);
+        assert_eq!(reference.price, Decimal::new(10_100, 2));
+    }
+
+    #[test]
     fn historical_micro_snapshot_reconstructs_short_horizon_moves() {
         let klines = (0_i64..20)
             .map(|index| OneMinuteKline {
@@ -2654,8 +2814,46 @@ mod tests {
     }
 
     #[test]
+    fn live_quote_event_time_does_not_exceed_local_receive_time() {
+        assert_eq!(clamp_live_event_time_ms(10_500, 10_000), 10_000);
+        assert_eq!(clamp_live_event_time_ms(9_500, 10_000), 9_500);
+    }
+
+    #[tokio::test]
+    async fn second_kline_trigger_time_does_not_exceed_local_receive_time() {
+        let client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("client");
+        let mut rx = client.subscribe_triggers();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let open_time_ms = now_ms.div_euclid(1_000).saturating_mul(1_000);
+        let close_time_ms = now_ms.saturating_add(10_000);
+        let payload = format!(r#"{{"k":{{"t":{open_time_ms},"T":{close_time_ms},"o":"100.00"}}}}"#);
+
+        client
+            .update_second_kline("btcusdt", &payload)
+            .await
+            .expect("future-close kline");
+        rx.changed().await.expect("kline trigger");
+        let event = rx.borrow_and_update().clone().expect("trigger event");
+
+        assert_eq!(event.source, BinanceTriggerSource::OneSecondKline);
+        assert!(event.event_time_ms <= event.received_time_ms);
+        let cache = client.second_kline_cache.read().await;
+        let cached = cache
+            .get("BTCUSDT")
+            .and_then(|klines| klines.back())
+            .expect("cached second kline");
+        assert!(cached.close_time_ms <= event.received_time_ms);
+    }
+
+    #[test]
     fn exchange_book_pressure_detects_bid_depth_imbalance() {
         let snapshot = LiveBookDepthSnapshot {
+            event_time_ms: 1_000,
             received_time_ms: 1_000,
             bids: vec![
                 LiveBookLevel {
@@ -2819,14 +3017,94 @@ mod tests {
         let health = client
             .live_market_data_health_for_symbols(&["BTCUSDT"])
             .await;
+        assert_eq!(health[0].quote_source, Some("Coinbase::Level2"));
         assert!(health[0].has_fresh_depth(10_000));
         let live_state = client.live_snapshot_cache.read().await;
         let state = live_state.get("BTCUSDT").expect("live signal state");
+        assert_eq!(
+            state.snapshot.current_spot_source,
+            Some(SpotQuoteSource::CoinbaseLevel2)
+        );
         let pressure = state
             .snapshot
             .exchange_book_pressure
             .expect("book pressure");
         assert!(pressure.depth_imbalance_bps > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn older_binance_arrival_does_not_displace_newer_coinbase_l2_quote() {
+        let client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("client");
+        client
+            .update_trade_quote("btcusdt", r#"{"E":10000,"p":"100.00"}"#)
+            .await
+            .expect("seed primary binance quote");
+        client
+            .ingest_coinbase_l2_book(
+                "btcusdt",
+                11_000,
+                vec![(Decimal::new(10_001, 2), Decimal::new(5, 0))],
+                vec![(Decimal::new(10_003, 2), Decimal::new(1, 0))],
+                Decimal::from(25_u32),
+            )
+            .await
+            .expect("ingest coinbase l2");
+        client
+            .update_trade_quote("btcusdt", r#"{"E":10500,"p":"100.01"}"#)
+            .await
+            .expect("late older Binance quote");
+
+        let cache = client.live_snapshot_cache.read().await;
+        let state = cache.get("BTCUSDT").expect("live signal state");
+        assert_eq!(state.latest_quote_time_ms, 11_000);
+        assert_eq!(
+            state.snapshot.current_spot_source,
+            Some(SpotQuoteSource::CoinbaseLevel2)
+        );
+        assert_eq!(state.snapshot.current_spot_price, Decimal::new(10_002, 2));
+    }
+
+    #[tokio::test]
+    async fn older_coinbase_l2_arrival_does_not_displace_newer_binance_depth() {
+        let client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("client");
+        client
+            .update_trade_quote("btcusdt", r#"{"E":10000,"p":"100.00"}"#)
+            .await
+            .expect("seed primary binance quote");
+        client
+            .update_depth_snapshot(
+                "btcusdt",
+                r#"{"bids":[["99.99","5"]],"asks":[["100.01","1"]]}"#,
+            )
+            .await
+            .expect("seed newer Binance depth");
+
+        let accepted = client
+            .ingest_coinbase_l2_book(
+                "btcusdt",
+                11_000,
+                vec![(Decimal::new(10_000, 2), Decimal::new(5, 0))],
+                vec![(Decimal::new(10_002, 2), Decimal::new(1, 0))],
+                Decimal::from(25_u32),
+            )
+            .await
+            .expect("ingest delayed coinbase l2");
+
+        assert!(!accepted);
+        let cache = client.book_depth_cache.read().await;
+        let snapshot = cache.get("BTCUSDT").expect("newer Binance depth");
+        assert_eq!(snapshot.bids[0].price, Decimal::new(9_999, 2));
+        assert_eq!(snapshot.asks[0].price, Decimal::new(10_001, 2));
     }
 
     #[tokio::test]
@@ -2849,6 +3127,49 @@ mod tests {
             .expect("ingest coinbase quote");
 
         assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn older_coinbase_ticker_arrival_does_not_emit_reactive_trigger() {
+        let client = BinanceClient::new(
+            "https://example.invalid".to_owned(),
+            "wss://example.invalid/ws".to_owned(),
+            1,
+        )
+        .expect("client");
+        let mut rx = client.subscribe_triggers();
+        client
+            .update_trade_quote("btcusdt", r#"{"E":10000,"p":"100.00"}"#)
+            .await
+            .expect("seed primary binance quote");
+        rx.changed().await.expect("binance trigger");
+        let _ = rx.borrow_and_update();
+        assert!(
+            client
+                .ingest_coinbase_ticker_quote(
+                    "btcusdt",
+                    11_000,
+                    Decimal::new(10_005, 2),
+                    Decimal::from(25_u32),
+                )
+                .await
+                .expect("ingest newer coinbase quote")
+        );
+        rx.changed().await.expect("newer coinbase trigger");
+        let _ = rx.borrow_and_update();
+
+        let accepted = client
+            .ingest_coinbase_ticker_quote(
+                "btcusdt",
+                10_500,
+                Decimal::new(10_004, 2),
+                Decimal::from(25_u32),
+            )
+            .await
+            .expect("ingest delayed coinbase quote");
+
+        assert!(!accepted);
+        assert!(!rx.has_changed().expect("trigger channel"));
     }
 
     #[tokio::test]
@@ -3013,6 +3334,37 @@ mod tests {
         prune_second_kline_history(&mut klines, 36_999);
         assert_eq!(klines.len(), 2);
         assert_eq!(klines.front().map(|kline| kline.open_time_ms), Some(6_000));
+    }
+
+    #[test]
+    fn second_kline_upsert_keeps_history_ordered_and_ignores_duplicate() {
+        let mut klines = VecDeque::from([
+            LiveSecondKline {
+                open_time_ms: 1_000,
+                close_time_ms: 1_999,
+                open: Decimal::new(10_000, 2),
+            },
+            LiveSecondKline {
+                open_time_ms: 3_000,
+                close_time_ms: 3_999,
+                open: Decimal::new(10_200, 2),
+            },
+        ]);
+        let late = LiveSecondKline {
+            open_time_ms: 2_000,
+            close_time_ms: 2_999,
+            open: Decimal::new(10_100, 2),
+        };
+
+        assert!(upsert_second_kline_ordered(&mut klines, late));
+        assert_eq!(
+            klines
+                .iter()
+                .map(|kline| kline.open_time_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000]
+        );
+        assert!(!upsert_second_kline_ordered(&mut klines, late));
     }
 
     #[test]

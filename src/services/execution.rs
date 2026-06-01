@@ -4,6 +4,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,6 +22,7 @@ use super::binance::{MarketWindowResolution, WindowDirection};
 
 pub(crate) const MAX_MARK_TO_MARKET_BID_LEVELS: usize = 3;
 const BPS_DENOMINATOR: u32 = 10_000;
+static PAPER_POSITION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Execution abstraction used by the runner.
 #[async_trait]
@@ -113,12 +115,14 @@ fn cost_from_bps(notional_usdc: Decimal, bps: u32) -> Decimal {
 /// Result of auto-settling one paper position.
 #[derive(Debug, Clone)]
 pub struct PaperCloseReport {
+    pub position_id: String,
     pub closed_at: DateTime<Utc>,
     pub slug: String,
     pub condition_id: String,
     pub question: String,
     pub kind: OpportunityKind,
     pub dominant_outcome_at_entry: String,
+    pub primary_outcome_at_entry: String,
     pub actual_outcome: WindowDirection,
     pub realized_payout_usdc: Decimal,
     pub realized_profit_usdc: Decimal,
@@ -166,6 +170,7 @@ impl PaperExecutor {
         let mut state = self.state.lock().await;
         let position = state.open_positions.remove(slug)?;
         let closed_at = Utc::now();
+        let primary_outcome_at_entry = paper_position_primary_outcome_label(&position);
         let payout = realized_payout(&position, resolution.actual_outcome).round_dp(6);
         let realized_profit = (payout - position.spent_usdc).round_dp(6);
         state.market_notional.remove(&position.condition_id);
@@ -174,12 +179,14 @@ impl PaperExecutor {
         state.closed_position_count += 1;
 
         Some(PaperCloseReport {
+            position_id: position.position_id,
             closed_at,
             slug: position.slug,
             condition_id: position.condition_id,
             question: position.question,
             kind: position.kind,
             dominant_outcome_at_entry: position.dominant_outcome_at_entry,
+            primary_outcome_at_entry,
             actual_outcome: resolution.actual_outcome,
             realized_payout_usdc: payout,
             realized_profit_usdc: realized_profit,
@@ -202,6 +209,7 @@ impl PaperExecutor {
         let mut state = self.state.lock().await;
         let position = state.open_positions.remove(slug)?;
         let closed_at = Utc::now();
+        let primary_outcome_at_entry = paper_position_primary_outcome_label(&position);
         let gross_payout = mark_to_market_payout(&position, books).round_dp(6);
         let (payout, exit_fee, exit_slippage) = self.cost_model.net_exit_payout(gross_payout);
         state.market_notional.remove(&position.condition_id);
@@ -213,12 +221,14 @@ impl PaperExecutor {
         state.closed_position_count += 1;
 
         Some(PaperCloseReport {
+            position_id: position.position_id,
             closed_at,
             slug: position.slug,
             condition_id: position.condition_id,
             question: position.question,
             kind: position.kind,
             dominant_outcome_at_entry: position.dominant_outcome_at_entry,
+            primary_outcome_at_entry,
             actual_outcome: WindowDirection::Flat,
             realized_payout_usdc: payout,
             realized_profit_usdc: realized_profit,
@@ -255,6 +265,7 @@ impl PaperExecutor {
         let mut state = self.state.lock().await;
         let mut position = state.open_positions.remove(slug)?;
         let closed_at = Utc::now();
+        let primary_outcome_at_entry = paper_position_primary_outcome_label(&position);
         let original_spent = position.spent_usdc;
         let closed_spent = (original_spent * fraction).round_dp(6);
         if closed_spent <= Decimal::ZERO {
@@ -313,12 +324,14 @@ impl PaperExecutor {
         }
 
         Some(PaperCloseReport {
+            position_id: position.position_id.clone(),
             closed_at,
             slug: position.slug.clone(),
             condition_id: position.condition_id.clone(),
             question: position.question.clone(),
             kind: position.kind,
             dominant_outcome_at_entry: position.dominant_outcome_at_entry.clone(),
+            primary_outcome_at_entry,
             actual_outcome: WindowDirection::Flat,
             realized_payout_usdc: payout,
             realized_profit_usdc: realized_profit,
@@ -488,6 +501,7 @@ fn build_paper_position(
         }
     }
     PaperPosition {
+        position_id: next_paper_position_id(opened_at),
         opened_at,
         scheduled_close_at: scheduled_close_at_for_slug(&opportunity.slug),
         condition_id: opportunity.condition_id.clone(),
@@ -503,6 +517,14 @@ fn build_paper_position(
         best_entry_reference_price: paper_entry_reference_price(opportunity),
         legs,
     }
+}
+
+fn next_paper_position_id(opened_at: DateTime<Utc>) -> String {
+    format!(
+        "paper-pos-{}-{}",
+        opened_at.timestamp_micros(),
+        PAPER_POSITION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn merge_paper_position(existing: &mut PaperPosition, addition: PaperPosition) {
@@ -606,6 +628,22 @@ fn scheduled_close_at_for_slug(slug: &str) -> Option<DateTime<Utc>> {
         .parse::<i64>()
         .ok()?;
     DateTime::from_timestamp(start_ts + target.window_secs(), 0)
+}
+
+fn paper_position_primary_outcome_label(position: &PaperPosition) -> String {
+    position
+        .legs
+        .iter()
+        .filter(|leg| leg.side != PaperOutcomeSide::Unknown)
+        .max_by(|left, right| {
+            left.shares
+                .partial_cmp(&right.shares)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or_else(
+            || position.dominant_outcome_at_entry.clone(),
+            |leg| leg.label.clone(),
+        )
 }
 
 fn realized_payout(position: &PaperPosition, actual_outcome: WindowDirection) -> Decimal {
@@ -1343,6 +1381,10 @@ mod tests {
         assert_eq!(
             close_report.realized_profit_usdc,
             Decimal::new(10, 0) - opportunity.required_usdc
+        );
+        assert_eq!(
+            close_report.primary_outcome_at_entry,
+            opportunity.primary_outcome_label
         );
     }
 }

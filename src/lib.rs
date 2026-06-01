@@ -1,7 +1,7 @@
-//! Polymarket BTC 5-minute bundle-trading bot.
+//! Low-latency Polymarket research and paper-trading toolkit.
 //!
-//! The strategy scans `BTC up/down 5m` markets and looks for cases where
-//! the best ask for `Up` plus the best ask for `Down` is below `1.00`.
+//! The application combines Polymarket order books with exchange and oracle
+//! feeds for controlled strategy experiments across short crypto windows.
 
 pub mod config;
 pub mod error;

@@ -494,6 +494,8 @@ pub struct PaperPositionLeg {
 /// Open paper position tracked between entry and auto-settlement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperPosition {
+    #[serde(default)]
+    pub position_id: String,
     pub opened_at: DateTime<Utc>,
     pub scheduled_close_at: Option<DateTime<Utc>>,
     pub condition_id: String,

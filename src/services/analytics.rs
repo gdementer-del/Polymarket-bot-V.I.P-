@@ -187,6 +187,7 @@ mod tests {
 
     fn build_entry(slug: &str, dominant_outcome: &str, edge_bps: u32) -> JournalEntry {
         JournalEntry {
+            run_id: "test-run".to_owned(),
             recorded_at: Utc::now(),
             opportunity: Opportunity {
                 kind: OpportunityKind::BundleArbitrage,
@@ -259,6 +260,7 @@ mod tests {
             build_entry("btc-updown-5m-2", "Down", 500),
         ];
         let snapshot = PnlSnapshot {
+            run_id: "test-run".to_owned(),
             updated_at: Utc::now(),
             execution_count: 2,
             paper_state: PaperState {

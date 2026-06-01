@@ -10,6 +10,7 @@ pub mod inventory;
 pub mod journal;
 mod labels;
 pub mod market_data;
+pub mod menu;
 pub mod polybacktest;
 pub mod research;
 pub mod runner;
