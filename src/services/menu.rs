@@ -127,7 +127,7 @@ impl OperatorMenu {
             println!("1. Локальный backtest");
             println!("2. PolyBacktest для BTC 5m");
             println!("3. Sweep параметров PolyBacktest для BTC 5m");
-            println!("4. Наблюдать публичную активность Bonereaper");
+            println!("4. Wallet research: запись, replay, compare и autotune");
             println!("5. Проверить live-учётные данные без отправки ордеров");
             println!("0. Назад");
             match prompt("Выберите пункт")?.as_str() {
@@ -160,12 +160,71 @@ impl OperatorMenu {
                     "--target",
                     "btc-5m",
                 ]))?,
-                "4" => self.run_child(args(&["follow-wallet", "--refresh-secs", "8"]))?,
+                "4" => self.wallet_research_menu()?,
                 "5" => self.run_child(args(&["auth-check"]))?,
                 "0" | "b" | "back" => return Ok(()),
                 _ => print_unknown_choice(),
             }
         }
+    }
+
+    fn wallet_research_menu(&self) -> Result<()> {
+        loop {
+            print_header("Wallet research", &self.config);
+            println!("1. Наблюдать публичную активность Bonereaper");
+            println!("2. Наблюдать другой публичный кошелёк");
+            println!("3. Записывать snapshots активности Bonereaper");
+            println!("4. Сводка записанной активности");
+            println!("5. Replay-отчёт по inventory");
+            println!("6. Timeline одного replay-окна");
+            println!("7. Экспортировать replay dataset");
+            println!("8. Симулировать caps и cooldown на replay dataset");
+            println!("9. Сравнить несколько replay export JSON");
+            println!("10. Autotune caps и cooldown по replay export JSON");
+            println!("11. Калибровать alert thresholds по replay export JSON");
+            println!("0. Назад");
+            match prompt("Выберите пункт")?.as_str() {
+                "1" => self.run_child(args(&["follow-wallet", "--refresh-secs", "8"]))?,
+                "2" => self.follow_custom_wallet()?,
+                "3" => self.run_child(args(&["follow-wallet-record", "--refresh-secs", "8"]))?,
+                "4" => self.run_child(args(&["follow-wallet-report"]))?,
+                "5" => self.run_child(args(&["follow-wallet-replay-report"]))?,
+                "6" => self.run_child(args(&["follow-wallet-replay-window"]))?,
+                "7" => self.run_child(args(&["follow-wallet-replay-export"]))?,
+                "8" => self.run_child(args(&["follow-wallet-replay-simulate"]))?,
+                "9" => self.run_wallet_research_for_inputs("follow-wallet-research-compare")?,
+                "10" => self.run_wallet_research_for_inputs("follow-wallet-replay-autotune")?,
+                "11" => self.run_wallet_research_for_inputs("follow-wallet-alert-calibrate")?,
+                "0" | "b" | "back" => return Ok(()),
+                _ => print_unknown_choice(),
+            }
+        }
+    }
+
+    fn follow_custom_wallet(&self) -> Result<()> {
+        let wallet = prompt("Публичный wallet address")?;
+        if wallet.is_empty() {
+            println!("Wallet address не должен быть пустым.");
+            return pause();
+        }
+        self.run_child(vec![
+            "follow-wallet".to_owned(),
+            "--wallet".to_owned(),
+            wallet,
+            "--refresh-secs".to_owned(),
+            "8".to_owned(),
+        ])
+    }
+
+    fn run_wallet_research_for_inputs(&self, command: &str) -> Result<()> {
+        let Some(inputs) =
+            prompt_path_list("JSON-файлы через ; (пример: runs\\a.json; runs\\b.json)")?
+        else {
+            return Ok(());
+        };
+        let mut command_args = vec![command.to_owned(), "--inputs".to_owned()];
+        command_args.extend(inputs);
+        self.run_child(command_args)
     }
 
     fn run_paper_for_minutes(&self, minutes: u64) -> Result<()> {
@@ -297,6 +356,22 @@ fn prompt_positive_u64(label: &str) -> Result<Option<u64>> {
     }
 }
 
+fn prompt_path_list(label: &str) -> Result<Option<Vec<String>>> {
+    let raw = prompt(label)?;
+    let paths = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        println!("Добавьте хотя бы один путь к JSON-файлу.");
+        pause()?;
+        return Ok(None);
+    }
+    Ok(Some(paths))
+}
+
 fn prompt(label: &str) -> Result<String> {
     print!("{label}: ");
     io::stdout().flush()?;
@@ -399,5 +474,16 @@ mod tests {
         assert_eq!(parse_index("0", 3), None);
         assert_eq!(parse_index("4", 3), None);
         assert_eq!(parse_index("not-a-number", 3), None);
+    }
+
+    #[test]
+    fn wallet_research_inputs_preserve_windows_paths_with_spaces() {
+        let paths = "runs\\first export.json; runs\\second.json"
+            .split(';')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["runs\\first export.json", "runs\\second.json"]);
     }
 }
