@@ -1,0 +1,198 @@
+# Paper-only raw-light profile.
+# Goal: keep the raw CodexScalpProbe edge test, but remove the worst ablation noise:
+# repeated entries, stale quotes, wide books, and weak non-BTC continuation.
+
+[http]
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+data_api_base_url = "https://data-api.polymarket.com"
+geoblock_url = "https://polymarket.com/api/geoblock"
+binance_base_url = "https://api.binance.com"
+binance_ws_base_url = "wss://stream.binance.com:9443/ws"
+coinbase_market_data_enabled = true
+coinbase_ws_base_url = "wss://ws-feed.exchange.coinbase.com"
+coinbase_max_source_disagreement_bps = "100"
+coinbase_max_spread_bps = "25"
+timeout_secs = 6
+page_size = 200
+books_batch_size = 100
+
+[strategy]
+market_targets = ["btc-5m", "eth-5m", "sol-5m", "xrp-5m"]
+enable_bundle = false
+min_edge_bps = 0
+assumed_fee_bps = 100
+min_spot_move_bps = 0
+min_liquidity_usdc = "0"
+min_top_of_book_shares = "1"
+max_bundle_notional_usdc = "10000"
+max_directional_notional_usdc = "10000"
+max_market_notional_usdc = "10000"
+min_seconds_left = 0
+max_seconds_left = 300
+min_minutes_to_expiry = 0
+max_markets = 200
+
+enable_directional = false
+directional_min_spot_move_bps = 0
+directional_min_signal_bps = 0
+directional_min_velocity_bps_per_minute = 0
+directional_min_model_edge_bps = 0
+directional_confidence_bps_per_spot_bps = 420
+directional_projection_cap_multiplier = "3.0"
+directional_trade_flow_weight = "0.65"
+directional_micro_signal_weight = "0.50"
+directional_micro_burst_weight = "0.15"
+directional_require_hedge_for_soft_entry = false
+directional_execution_slippage_bps = 35
+directional_max_fair_price = "0.99"
+directional_max_entry_price = "0.99"
+
+enable_micro_breakout = false
+enable_target_state_v1 = false
+enable_bonereaper_state_v1 = false
+enable_bonereaper_state_v2 = false
+enable_bonereaper_state_guarded = false
+enable_codex_sentinel_v1 = false
+
+enable_codex_scalp_probe_v1 = true
+codex_scalp_probe_v1_raw_ablation_enabled = true
+codex_scalp_probe_v1_raw_light_enabled = true
+codex_scalp_probe_v1_min_entry_price = "0.01"
+codex_scalp_probe_v1_max_entry_price = "0.99"
+codex_scalp_probe_v1_max_entry_spread = "0.20"
+codex_scalp_probe_v1_min_elapsed_window_secs = 0
+codex_scalp_probe_v1_max_seconds_left = 300
+codex_scalp_probe_v1_min_seconds_left = 0
+codex_scalp_probe_v1_max_book_age_ms = 1000
+codex_scalp_probe_v1_max_exchange_spread_bps = "10.00"
+codex_scalp_probe_v1_min_target_gap_bps = "0.00"
+codex_scalp_probe_v1_min_fresh_bps = "0.00"
+codex_scalp_probe_v1_min_signal_bps = "0"
+codex_scalp_probe_v1_min_flow_bps = "0"
+codex_scalp_probe_v1_min_top_imbalance_bps = "0"
+codex_scalp_probe_v1_min_depth_imbalance_bps = "0"
+codex_scalp_probe_v1_min_radar_score_bps = "0"
+codex_scalp_probe_v1_notional_usdc = "5"
+codex_scalp_probe_v1_min_expected_profit_usdc = "0.00"
+codex_scalp_probe_v1_bnb_pressure_enabled = false
+
+codex_sentinel_v1_live_quote_age_guard_enabled = false
+codex_sentinel_v1_max_live_quote_age_ms = 3000
+codex_sentinel_v1_entry_spread_guard_enabled = false
+codex_sentinel_v1_stale_micro_guard_enabled = false
+codex_sentinel_v1_premium_entry_guard_enabled = false
+codex_sentinel_v1_aggressive_continuation_enabled = false
+codex_sentinel_v1_expensive_entry_guard_enabled = false
+codex_sentinel_v1_quality_floor_enabled = false
+codex_sentinel_v1_mid_gap_premium_guard_enabled = false
+codex_sentinel_v1_bad_window_guard_enabled = false
+codex_sentinel_v1_confidence_sizing_enabled = false
+codex_sentinel_v1_low_flow_guard_enabled = false
+codex_sentinel_v1_counter_burst_guard_enabled = false
+codex_breakout_v1_enabled = false
+codex_breakout_v1_required = false
+codex_sentinel_v1_discount_value_lane_enabled = false
+
+bonereaper_state_v2_min_elapsed_window_secs = 0
+bonereaper_state_v2_max_seconds_left = 300
+bonereaper_state_v2_min_seconds_left = 0
+bonereaper_state_v2_bias_min_target_gap_bps = "0.00"
+bonereaper_state_v2_flip_max_target_gap_bps = "999.00"
+bonereaper_state_v2_min_signal_bps = 0
+bonereaper_state_v2_min_spot_move_15s_bps = "0.00"
+bonereaper_state_v2_min_spot_move_5s_bps = "0.00"
+bonereaper_state_v2_min_aligned_flow_bps = "0.00"
+bonereaper_state_v2_max_entry_price = "0.99"
+bonereaper_state_v2_max_fair_price = "0.99"
+bonereaper_state_v2_probe_notional_usdc = "5"
+bonereaper_state_v2_normal_notional_usdc = "5"
+bonereaper_state_v2_strong_notional_usdc = "5"
+bonereaper_state_v2_strong_gap_bps = "0.00"
+bonereaper_state_v2_strong_flow_bps = "0.00"
+bonereaper_state_v2_min_expected_profit_usdc = "0.00"
+bonereaper_state_v2_micro_alignment_guard_enabled = false
+bonereaper_state_v2_early_window_guard_enabled = false
+bonereaper_state_v2_high_gap_guard_enabled = false
+bonereaper_state_v2_mid_gap_guard_enabled = false
+bonereaper_state_v2_low_gap_guard_enabled = false
+bonereaper_state_v2_early_expensive_guard_enabled = false
+
+enable_tail_hedge = false
+tail_hedge_ratio = "0.00"
+tail_hedge_max_opposite_price = "0.99"
+tail_hedge_max_bundle_cost = "1.50"
+tail_hedge_open_window_secs = 300
+
+[run]
+mode = "paper"
+poll_interval_secs = 1
+paper_starting_balance_usdc = "10000"
+paper_start_mode = "isolated"
+reactive = true
+reactive_debounce_ms = 25
+reactive_idle_secs = 0
+allow_repeat_entries_same_window = false
+revalidate_before_execute = true
+execute_top_n = 5
+
+[run.polymarket_stream]
+enabled = true
+book_staleness_ms = 5000
+backfill_trade_flow = false
+
+[run.scale_in]
+enabled = false
+
+[run.early_exit]
+enabled = false
+
+[run.adaptive_regime]
+enabled = false
+
+[run.risk]
+max_daily_loss_usdc = "0"
+max_session_loss_usdc = "0"
+max_open_notional_usdc = "0"
+max_unrealized_loss_usdc = "0"
+max_consecutive_losses = 0
+cooldown_cycles = 0
+apply_in_live_mode = false
+seed_from_history = false
+reset_daily_on_start = true
+
+[run.v4_inventory]
+enabled = true
+max_gross_inventory_shares_per_window = "1000"
+max_directional_delta_shares_per_window = "1000"
+max_window_spent_usdc = "6"
+max_entries_per_window = 1
+cooldown_secs = 1
+cooldown_on_stop_loss = false
+cooldown_on_reversal = false
+cooldown_on_partial_reversal = false
+
+[live]
+private_key_env = "POLYMARKET_PRIVATE_KEY"
+api_key_env = "POLYMARKET_API_KEY"
+api_secret_env = "POLYMARKET_API_SECRET"
+api_passphrase_env = "POLYMARKET_API_PASSPHRASE"
+prompt_for_secrets = true
+signature_type = "proxy"
+
+[polybacktest]
+base_url = "https://api.polybacktest.com"
+api_key_env = "POLYBACKTEST_API_KEY"
+prompt_for_api_key = true
+snapshot_page_limit = 250
+include_orderbook = true
+cache_enabled = true
+cache_dir = "state/polybacktest-cache"
+
+[storage]
+state_dir = "state/scalp-v1-raw-light-v2"
+execution_journal_filename = "trade_journal.jsonl"
+pnl_snapshot_filename = "pnl_snapshot.json"
+paper_cycle_journal_filename = "paper_cycle_journal.jsonl"
+paper_cycle_journal_sample_secs = 5
+paper_trade_journal_filename = "paper_trade_journal.jsonl"

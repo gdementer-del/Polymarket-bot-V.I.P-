@@ -1,0 +1,66 @@
+[http]
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+data_api_base_url = "https://data-api.polymarket.com"
+geoblock_url = "https://polymarket.com/api/geoblock"
+binance_base_url = "https://api.binance.com"
+binance_ws_base_url = "wss://stream.binance.com:9443/ws"
+timeout_secs = 15
+page_size = 200
+books_batch_size = 100
+
+[strategy]
+market_targets = ["btc-5m", "btc-15m"]
+enable_bundle = true
+min_edge_bps = 25
+assumed_fee_bps = 0
+min_spot_move_bps = 5
+min_liquidity_usdc = "5000"
+min_top_of_book_shares = "25"
+max_bundle_notional_usdc = "50"
+max_directional_notional_usdc = "30"
+directional_soft_entry_max_notional_usdc = "30"
+max_market_notional_usdc = "150"
+min_seconds_left = 20
+max_seconds_left = 299
+min_minutes_to_expiry = 30
+max_markets = 200
+enable_directional = true
+directional_min_spot_move_bps = 12
+directional_min_velocity_bps_per_minute = 6
+directional_min_model_edge_bps = 15
+directional_confidence_bps_per_spot_bps = 25
+directional_projection_cap_multiplier = "2.0"
+directional_trade_flow_weight = "0.35"
+directional_max_fair_price = "0.72"
+directional_max_entry_price = "0.60"
+enable_tail_hedge = true
+tail_hedge_ratio = "0.25"
+tail_hedge_max_opposite_price = "0.25"
+tail_hedge_max_bundle_cost = "0.99"
+tail_hedge_open_window_secs = 20
+
+[run]
+mode = "paper"
+poll_interval_secs = 15
+execute_top_n = 1
+
+[live]
+private_key_env = "POLYMARKET_PRIVATE_KEY"
+api_key_env = "POLYMARKET_API_KEY"
+api_secret_env = "POLYMARKET_API_SECRET"
+api_passphrase_env = "POLYMARKET_API_PASSPHRASE"
+prompt_for_secrets = true
+signature_type = "proxy"
+
+[polybacktest]
+base_url = "https://api.polybacktest.com"
+api_key_env = "POLYBACKTEST_API_KEY"
+prompt_for_api_key = true
+snapshot_page_limit = 250
+include_orderbook = true
+
+[storage]
+state_dir = "state"
+execution_journal_filename = "trade_journal.jsonl"
+pnl_snapshot_filename = "pnl_snapshot.json"
