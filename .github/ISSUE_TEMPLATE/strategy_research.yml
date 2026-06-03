@@ -1,0 +1,40 @@
+name: Strategy research proposal
+description: Propose a testable strategy or model change
+title: "Strategy research: "
+labels: []
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis
+      description: What edge might exist, and why should it persist after spread, slippage, and latency?
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: Required data
+      description: Which feeds, markets, windows, and historical samples are needed?
+    validations:
+      required: true
+  - type: textarea
+    id: rule
+    attributes:
+      label: Proposed decision rule
+      description: Entry, exit, sizing, and validation criteria.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: Backtest, replay, paper run, sample-size target, and expected failure modes.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: This proposal does not rely on non-public information, manipulation, wash trading, spoofing, or platform bypasses.
+          required: true

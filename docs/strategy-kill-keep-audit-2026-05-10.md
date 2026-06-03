@@ -97,7 +97,7 @@ Stop judging the strategy from short live/paper runs. The next useful work is a 
 Suggested next matrix:
 
 ```powershell
-$env:POLYBACKTEST_API_KEY = "<set locally, do not commit>"
+# Set POLYBACKTEST_API_KEY locally before running this command.
 target\debug\polymarket_mvp.exe --config config.sentinel.toml polybacktest --windows-per-target 500 --entry-minutes 1 --target btc-5m
 ```
 

@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.96.0"
 description = "Low-latency Polymarket research and paper-trading toolkit"
 license = "MIT"
+repository = "https://github.com/gdementer-del/Polymarket-bot-V.I.P-"
+readme = "README.md"
+keywords = ["polymarket", "prediction-markets", "backtesting", "market-data"]
+categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [dependencies]

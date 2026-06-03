@@ -7,7 +7,7 @@ Use this protocol before changing the active paper/live strategy. The goal is to
 The comparison script snapshots both configs into a run directory, gives each config an isolated `state_dir`, runs the same PolyBacktest window set, and writes a machine-readable summary plus a `PASS` / `NO-GO` decision.
 
 ```powershell
-$env:POLYBACKTEST_API_KEY = "<set locally, never commit>"
+# Set POLYBACKTEST_API_KEY locally before running this command.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\compare-strategy-configs.ps1 `
   -BaselineConfig .\config.scalp-v1.toml `
   -CandidateConfig .\config.scalp-v1.toml `

@@ -9,6 +9,24 @@ This project is intended primarily for research and simulation. Positive PnL is
 not guaranteed. Before using any strategy with real funds, validate fees,
 slippage, liquidity, and out-of-sample stability independently.
 
+## Open Source Status
+
+This repository is maintained as an open-source Rust research toolkit under the
+MIT license. It is intended for maintainers, researchers, and developers who
+want to study prediction-market data ingestion, paper-trading workflows,
+strategy evaluation, and market microstructure tooling.
+
+Useful maintainer documents:
+
+| File | Purpose |
+| --- | --- |
+| `LICENSE` | MIT license terms |
+| `CONTRIBUTING.md` | Contribution workflow, validation checklist, and maintainer expectations |
+| `ROADMAP.md` | Planned data, backtesting, architecture, and research work |
+| `CHANGELOG.md` | Release notes and user-facing changes |
+| `SECURITY.md` | Secret-handling and vulnerability reporting guidance |
+| `.github/ISSUE_TEMPLATE/` | Structured bug, feature, and strategy-research triage |
+
 ## Quick Start
 
 ### 1. Install Rust
@@ -159,7 +177,7 @@ time intervals, account for sample size, and validate results out of sample.
 Cloud PolyBacktest requires a token in the current PowerShell session:
 
 ```powershell
-$env:POLYBACKTEST_API_KEY = "your_token"
+# Set POLYBACKTEST_API_KEY in your shell before running this command.
 & $bot --config $config polybacktest --windows-per-target 30 --entry-minutes 1 --top 10 --target btc-5m
 ```
 
@@ -171,7 +189,7 @@ Paper tests do not require Polymarket credentials. If you separately research th
 live API, use environment variables in the current PowerShell session:
 
 ```powershell
-$env:POLYMARKET_API_KEY = "..."
+# Set POLYMARKET_API_KEY and related variables in your shell only.
 ```
 
 Supported variables are listed in `.env.example`. The `.env` file is excluded
@@ -205,6 +223,26 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
+## Maintainer Workflow
+
+The project is maintained through public issues, pull requests, release notes,
+and reproducible validation. Strategy-related changes should include a clear
+hypothesis, sample-size notes, and backtest, replay, or controlled paper-run
+evidence. Refactors should preserve paper-first behavior unless the pull request
+explicitly documents a behavior change.
+
+Issue triage priorities:
+
+| Priority | Examples |
+| --- | --- |
+| Correctness | Broken config parsing, stale data handling, journal durability, wrong PnL accounting |
+| Data quality | Exchange feed lag, missing market subscriptions, oracle anchor issues |
+| Research quality | Strategy hypotheses, backtest comparability, sample-size limits |
+| Maintainability | Runner decomposition, tests, docs, config cleanup |
+
+Releases should summarize user-facing changes, config migrations, validation
+status, and known limitations. The current release line starts at `v0.1.0`.
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -235,3 +273,7 @@ scripts/                 helper PowerShell scripts
 This is research software, not financial advice. Prediction markets and trading
 systems involve substantial risk. Paper PnL does not prove a durable edge in live
 execution.
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE` for details.
